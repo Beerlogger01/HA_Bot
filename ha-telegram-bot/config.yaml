@@ -1,0 +1,39 @@
+name: "Home Assistant Telegram Bot"
+version: "1.0.0"
+slug: ha_telegram_bot
+description: "Custom Telegram bot to control Home Assistant with security, rate limiting, and audit logging"
+arch:
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+init: false
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
+
+options:
+  bot_token: ""
+  allowed_chat_id: 0
+  allowed_user_ids: []
+  cooldown_seconds: 2
+  global_rate_limit_actions: 10
+  global_rate_limit_window: 5
+  status_entities: []
+  light_entity_id: ""
+  vacuum_entity_id: ""
+  goodnight_scene_id: ""
+
+schema:
+  bot_token: password
+  allowed_chat_id: int
+  allowed_user_ids: 
+    - int
+  cooldown_seconds: int(1,60)
+  global_rate_limit_actions: int(1,100)
+  global_rate_limit_window: int(1,60)
+  status_entities:
+    - str
+  light_entity_id: str
+  vacuum_entity_id: str
+  goodnight_scene_id: str
