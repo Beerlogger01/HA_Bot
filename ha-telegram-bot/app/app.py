@@ -4,13 +4,16 @@ Home Assistant Telegram Bot Add-on.
 
 Secure Telegram bot for controlling Home Assistant via Supervisor proxy API.
 
-Production-hardened version:
-- Single persistent SQLite connection with WAL mode
-- Atomic cooldown checks (UPSERT)
-- HA API retry with exponential back-off and timeouts
-- Structured JSON logs (never leaks tokens)
-- Graceful SIGTERM handling (via aiogram)
-- Guard against from_user=None, inaccessible messages, Telegram API errors
+Features:
+- Multi-level interactive menu with inline buttons
+- Dynamic device/action discovery from Home Assistant
+- Vacuum room targeting (script or service_data mode)
+- Edit-in-place message cleanup
+- Security: chat/user whitelisting, deny-by-default
+- Rate limiting: per-user cooldown + global sliding window
+- Audit logging: structured JSON stdout + SQLite
+- Retry with exponential backoff for HA API
+- Graceful shutdown on SIGTERM
 """
 
 from __future__ import annotations
@@ -20,23 +23,16 @@ import json
 import logging
 import os
 import sys
-import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import aiohttp
-import aiosqlite
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+
+from api import HAClient
+from handlers import GlobalRateLimiter, Handlers
+from storage import Database
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -45,15 +41,6 @@ from aiogram.types import (
 DATA_DIR = Path("/data")
 OPTIONS_PATH = DATA_DIR / "options.json"
 DB_PATH = DATA_DIR / "bot.sqlite3"
-
-HA_BASE_URL = "http://supervisor/core/api"
-HA_TIMEOUT = aiohttp.ClientTimeout(total=30, sock_connect=10, sock_read=20)
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE: float = 1.0  # seconds
-
-KNOWN_ACTIONS: frozenset[str] = frozenset(
-    {"light_on", "light_off", "vacuum_start", "vacuum_dock", "scene_goodnight"}
-)
 
 # ---------------------------------------------------------------------------
 # Logging — structured JSON on stdout
@@ -72,7 +59,6 @@ class _JsonFormatter(logging.Formatter):
         }
         if record.exc_info and record.exc_info[0] is not None:
             payload["exc"] = self.formatException(record.exc_info)
-        # Merge structured extras added via `extra={…}`
         for key in ("chat_id", "user_id", "username", "action", "ok", "error_detail"):
             val = getattr(record, key, None)
             if val is not None:
@@ -102,7 +88,7 @@ class Config:
     """Validated, immutable add-on configuration.
 
     supervisor_token is intentionally kept out of this dataclass so it can
-    never be serialised or logged by accident when the config is printed.
+    never be serialised or logged by accident.
     """
 
     bot_token: str
@@ -112,19 +98,27 @@ class Config:
     global_rate_limit_actions: int
     global_rate_limit_window: int
     status_entities: tuple[str, ...]
+    # Dynamic menu options
+    menu_domains_allowlist: tuple[str, ...]
+    menu_page_size: int
+    show_all_enabled: bool
+    # Vacuum room targeting
+    vacuum_room_strategy: str  # "script" or "service_data"
+    vacuum_room_script_entity_id: str
+    vacuum_room_presets: tuple[str, ...]
+    # Legacy single-entity options (still supported for backwards compat)
     light_entity_id: str
     vacuum_entity_id: str
     goodnight_scene_id: str
 
 
 def _load_and_validate_config() -> tuple[Config, str]:
-    """Load ``/data/options.json`` and ``SUPERVISOR_TOKEN``.
+    """Load /data/options.json and SUPERVISOR_TOKEN.
 
-    Returns ``(config, supervisor_token)``.
-    Exits the process with a clear log message on any validation failure.
+    Returns (config, supervisor_token).
+    Exits on validation failure.
     """
 
-    # --- options.json ---
     if not OPTIONS_PATH.exists():
         logger.critical("Configuration file not found: %s", OPTIONS_PATH)
         sys.exit(1)
@@ -159,7 +153,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
     if not user_ids_raw:
         logger.warning("allowed_user_ids is empty — all actions will be denied")
 
-    # -- optional with defaults --
+    # -- rate limiting --
     cooldown = raw.get("cooldown_seconds", 2)
     if not isinstance(cooldown, int) or cooldown < 0:
         logger.critical("cooldown_seconds must be a non-negative integer")
@@ -174,15 +168,20 @@ def _load_and_validate_config() -> tuple[Config, str]:
         logger.critical("global_rate_limit_window must be >= 1")
         sys.exit(1)
 
+    # -- status entities --
     status_raw = raw.get("status_entities", [])
     if not isinstance(status_raw, list):
         status_raw = []
+    for eid in status_raw:
+        if not isinstance(eid, str) or "." not in eid:
+            logger.critical("Invalid entity_id in status_entities: '%s'", eid)
+            sys.exit(1)
 
+    # -- legacy single-entity options --
     light = raw.get("light_entity_id", "") or ""
     vacuum = raw.get("vacuum_entity_id", "") or ""
     scene = raw.get("goodnight_scene_id", "") or ""
 
-    # entity_id format: must contain a dot
     for label, eid in [
         ("light_entity_id", light),
         ("vacuum_entity_id", vacuum),
@@ -194,10 +193,52 @@ def _load_and_validate_config() -> tuple[Config, str]:
             )
             sys.exit(1)
 
-    for eid in status_raw:
-        if not isinstance(eid, str) or "." not in eid:
-            logger.critical("Invalid entity_id in status_entities: '%s'", eid)
-            sys.exit(1)
+    # -- dynamic menu options --
+    default_domains = ["light", "switch", "vacuum", "scene", "script", "climate", "fan", "cover"]
+    domains_allowlist = raw.get("menu_domains_allowlist", default_domains)
+    if not isinstance(domains_allowlist, list):
+        domains_allowlist = default_domains
+    # Validate domain names are simple strings
+    domains_allowlist = [d for d in domains_allowlist if isinstance(d, str) and d.strip()]
+    if not domains_allowlist:
+        domains_allowlist = default_domains
+
+    menu_page_size = raw.get("menu_page_size", 8)
+    if not isinstance(menu_page_size, int) or menu_page_size < 1:
+        logger.warning("menu_page_size invalid, defaulting to 8")
+        menu_page_size = 8
+    menu_page_size = min(menu_page_size, 20)  # Cap at 20
+
+    show_all_enabled = raw.get("show_all_enabled", False)
+    if not isinstance(show_all_enabled, bool):
+        show_all_enabled = False
+
+    # -- vacuum room targeting --
+    vacuum_room_strategy = raw.get("vacuum_room_strategy", "service_data")
+    if vacuum_room_strategy not in ("script", "service_data"):
+        logger.warning(
+            "vacuum_room_strategy='%s' invalid, defaulting to 'service_data'",
+            vacuum_room_strategy,
+        )
+        vacuum_room_strategy = "service_data"
+
+    vacuum_room_script = raw.get("vacuum_room_script_entity_id", "") or ""
+    if vacuum_room_script and "." not in vacuum_room_script:
+        logger.critical(
+            "vacuum_room_script_entity_id='%s' is not a valid entity_id",
+            vacuum_room_script,
+        )
+        sys.exit(1)
+
+    vacuum_rooms_raw = raw.get(
+        "vacuum_room_presets",
+        ["bathroom", "kitchen", "living_room", "bedroom"],
+    )
+    if not isinstance(vacuum_rooms_raw, list):
+        vacuum_rooms_raw = ["bathroom", "kitchen", "living_room", "bedroom"]
+    vacuum_rooms = tuple(
+        r for r in vacuum_rooms_raw if isinstance(r, str) and r.strip()
+    )
 
     # --- SUPERVISOR_TOKEN ---
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -213,323 +254,18 @@ def _load_and_validate_config() -> tuple[Config, str]:
         global_rate_limit_actions=rate_actions,
         global_rate_limit_window=rate_window,
         status_entities=tuple(status_raw),
+        menu_domains_allowlist=tuple(domains_allowlist),
+        menu_page_size=menu_page_size,
+        show_all_enabled=show_all_enabled,
+        vacuum_room_strategy=vacuum_room_strategy,
+        vacuum_room_script_entity_id=vacuum_room_script,
+        vacuum_room_presets=vacuum_rooms,
         light_entity_id=light,
         vacuum_entity_id=vacuum,
         goodnight_scene_id=scene,
     )
     return config, supervisor_token
 
-
-# ---------------------------------------------------------------------------
-# Database — single persistent connection, WAL mode, atomic cooldown
-# ---------------------------------------------------------------------------
-
-
-class Database:
-    """Manages a persistent SQLite connection with WAL journal mode."""
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._db: aiosqlite.Connection | None = None
-
-    async def open(self) -> None:
-        self._db = await aiosqlite.connect(str(self._path))
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._db.execute("PRAGMA busy_timeout=5000")
-        await self._db.execute(
-            """CREATE TABLE IF NOT EXISTS cooldowns (
-                   user_id   INTEGER NOT NULL,
-                   action    TEXT    NOT NULL,
-                   last_used REAL    NOT NULL,
-                   PRIMARY KEY (user_id, action)
-               )"""
-        )
-        await self._db.execute(
-            """CREATE TABLE IF NOT EXISTS audit (
-                   id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                   timestamp TEXT    NOT NULL,
-                   chat_id   INTEGER NOT NULL,
-                   user_id   INTEGER NOT NULL,
-                   username  TEXT    NOT NULL,
-                   action    TEXT    NOT NULL,
-                   success   INTEGER NOT NULL,
-                   error     TEXT
-               )"""
-        )
-        await self._db.commit()
-        logger.info("Database opened: %s (WAL mode)", self._path)
-
-    async def close(self) -> None:
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
-
-    # --- cooldown ---
-
-    async def check_and_update_cooldown(
-        self, user_id: int, action: str, cooldown_seconds: int
-    ) -> tuple[bool, float]:
-        """Atomically check cooldown and update timestamp if allowed.
-
-        Uses a single persistent connection, so all operations are serialised
-        through aiosqlite's background thread — no race between SELECT and
-        UPSERT.
-
-        Returns ``(is_allowed, remaining_seconds)``.
-        """
-        assert self._db is not None
-        now = time.time()
-
-        async with self._db.execute(
-            "SELECT last_used FROM cooldowns WHERE user_id = ? AND action = ?",
-            (user_id, action),
-        ) as cur:
-            row = await cur.fetchone()
-
-        if row is not None:
-            elapsed = now - row[0]
-            if elapsed < cooldown_seconds:
-                return False, cooldown_seconds - elapsed
-
-        # Allowed — atomically upsert
-        await self._db.execute(
-            "INSERT INTO cooldowns (user_id, action, last_used) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id, action) DO UPDATE SET last_used = excluded.last_used",
-            (user_id, action, now),
-        )
-        await self._db.commit()
-        return True, 0.0
-
-    # --- audit ---
-
-    async def write_audit(
-        self,
-        *,
-        chat_id: int,
-        user_id: int,
-        username: str,
-        action: str,
-        success: bool,
-        error: str | None = None,
-    ) -> None:
-        assert self._db is not None
-        ts = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
-            "INSERT INTO audit (timestamp, chat_id, user_id, username, action, success, error) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ts, chat_id, user_id, username, action, 1 if success else 0, error),
-        )
-        await self._db.commit()
-
-
-# ---------------------------------------------------------------------------
-# Home Assistant API client — retries, timeouts, reused session
-# ---------------------------------------------------------------------------
-
-
-class HAClient:
-    """Communicates with Home Assistant Core API through the Supervisor proxy.
-
-    - Reuses a single ``aiohttp.ClientSession``
-    - Retries transient errors with exponential back-off
-    - Never logs the Supervisor token
-    """
-
-    def __init__(self, supervisor_token: str) -> None:
-        self._headers: dict[str, str] = {
-            "Authorization": f"Bearer {supervisor_token}",
-            "Content-Type": "application/json",
-        }
-        self._session: aiohttp.ClientSession | None = None
-
-    async def open(self) -> None:
-        self._session = aiohttp.ClientSession(timeout=HA_TIMEOUT)
-
-    async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
-
-    # -- internal request with retry --
-
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        json_data: dict[str, Any] | None = None,
-    ) -> tuple[bool, dict[str, Any] | str]:
-        """HTTP request with retry.  Returns ``(success, data_or_error)``."""
-        assert self._session is not None
-        url = f"{HA_BASE_URL}/{path}"
-        last_error = ""
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                async with self._session.request(
-                    method, url, json=json_data, headers=self._headers
-                ) as resp:
-                    if resp.status in (200, 201):
-                        try:
-                            data = await resp.json(content_type=None)
-                        except (json.JSONDecodeError, aiohttp.ContentTypeError):
-                            data = {}
-                        return True, data
-
-                    body = (await resp.text())[:300]
-                    last_error = f"HTTP {resp.status}: {body}"
-
-                    # Client errors except 429 — no retry
-                    if 400 <= resp.status < 500 and resp.status != 429:
-                        logger.error(
-                            "HA API client error (no retry): %s %s -> %s",
-                            method, path, last_error,
-                        )
-                        return False, last_error
-
-                    logger.warning(
-                        "HA API error (attempt %d/%d): %s %s -> %s",
-                        attempt, MAX_RETRIES, method, path, last_error,
-                    )
-            except asyncio.TimeoutError:
-                last_error = "Request timed out"
-                logger.warning(
-                    "HA API timeout (attempt %d/%d): %s %s",
-                    attempt, MAX_RETRIES, method, path,
-                )
-            except aiohttp.ClientError as exc:
-                last_error = f"Connection error: {exc}"
-                logger.warning(
-                    "HA API connection error (attempt %d/%d): %s %s -> %s",
-                    attempt, MAX_RETRIES, method, path, exc,
-                )
-
-            if attempt < MAX_RETRIES:
-                delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
-                await asyncio.sleep(delay)
-
-        logger.error(
-            "HA API failed after %d attempts: %s %s -> %s",
-            MAX_RETRIES, method, path, last_error,
-        )
-        return False, last_error
-
-    # -- public helpers --
-
-    async def call_service(
-        self, domain: str, service: str, data: dict[str, Any]
-    ) -> tuple[bool, str]:
-        """Call an HA service.  Returns ``(success, error_message_or_empty)``."""
-        ok, result = await self._request(
-            "POST", f"services/{domain}/{service}", json_data=data
-        )
-        if ok:
-            logger.info(
-                "Service called: %s.%s entity=%s",
-                domain, service, data.get("entity_id", "?"),
-            )
-            return True, ""
-        return False, str(result)
-
-    async def get_state(self, entity_id: str) -> dict[str, Any] | None:
-        """Return entity state dict or ``None`` on failure."""
-        ok, result = await self._request("GET", f"states/{entity_id}")
-        return result if ok and isinstance(result, dict) else None
-
-    async def get_config(self) -> dict[str, Any] | None:
-        """Fetch HA config (used for self-test at startup)."""
-        ok, result = await self._request("GET", "config")
-        return result if ok and isinstance(result, dict) else None
-
-
-# ---------------------------------------------------------------------------
-# In-memory global rate limiter (sliding window)
-# ---------------------------------------------------------------------------
-
-
-class GlobalRateLimiter:
-    """Simple in-memory sliding-window counter for the whole group.
-
-    Operates within a single asyncio event loop — no lock required.
-    Non-persistent: resets on add-on restart (by design — short window).
-    """
-
-    def __init__(self, max_actions: int, window_seconds: int) -> None:
-        self._max = max_actions
-        self._window = window_seconds
-        self._timestamps: list[float] = []
-
-    def check(self) -> bool:
-        """Return ``True`` if the action is within the rate limit."""
-        now = time.monotonic()
-        cutoff = now - self._window
-        self._timestamps = [t for t in self._timestamps if t > cutoff]
-        if len(self._timestamps) >= self._max:
-            return False
-        self._timestamps.append(now)
-        return True
-
-
-# ---------------------------------------------------------------------------
-# Audit helper — logs to both stdout (JSON) and SQLite
-# ---------------------------------------------------------------------------
-
-
-async def _audit(
-    db: Database,
-    *,
-    chat_id: int,
-    user_id: int,
-    username: str,
-    action: str,
-    success: bool,
-    error: str | None = None,
-) -> None:
-    logger.info(
-        "AUDIT",
-        extra={
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "username": username,
-            "action": action,
-            "ok": success,
-            "error_detail": error,
-        },
-    )
-    try:
-        await db.write_audit(
-            chat_id=chat_id,
-            user_id=user_id,
-            username=username,
-            action=action,
-            success=success,
-            error=error,
-        )
-    except Exception:
-        logger.exception("Failed to persist audit record")
-
-
-# ---------------------------------------------------------------------------
-# Action dispatch table
-# ---------------------------------------------------------------------------
-
-# callback_data -> (domain, service, config_attr, success_message)
-_ACTION_MAP: dict[str, tuple[str, str, str, str]] = {
-    "light_on": ("light", "turn_on", "light_entity_id", "💡 Light turned ON"),
-    "light_off": ("light", "turn_off", "light_entity_id", "🌑 Light turned OFF"),
-    "vacuum_start": ("vacuum", "start", "vacuum_entity_id", "🤖 Vacuum started"),
-    "vacuum_dock": (
-        "vacuum",
-        "return_to_base",
-        "vacuum_entity_id",
-        "🏠 Vacuum returning to dock",
-    ),
-    "scene_goodnight": (
-        "scene",
-        "turn_on",
-        "goodnight_scene_id",
-        "🌙 Good Night scene activated",
-    ),
-}
 
 # ---------------------------------------------------------------------------
 # Telegram Bot
@@ -549,14 +285,20 @@ class TelegramBot:
             config.global_rate_limit_actions,
             config.global_rate_limit_window,
         )
-        self._keyboard: InlineKeyboardMarkup | None = None
+        self._handlers = Handlers(
+            bot=self._bot,
+            ha=self._ha,
+            db=self._db,
+            config=config,
+            global_rl=self._global_rl,
+        )
 
-        # Register handlers
-        self._dp.message.register(self._cmd_start, Command("start"))
-        self._dp.message.register(self._cmd_status, Command("status"))
-        self._dp.callback_query.register(self._handle_callback)
-
-    # -- lifecycle --
+        # Register command handlers
+        self._dp.message.register(self._handlers.cmd_start, Command("start"))
+        self._dp.message.register(self._handlers.cmd_start, Command("menu"))
+        self._dp.message.register(self._handlers.cmd_status, Command("status"))
+        # Register callback query handler
+        self._dp.callback_query.register(self._handlers.handle_callback)
 
     async def run(self) -> None:
         """Open resources, perform self-test, then block on long-polling."""
@@ -582,7 +324,7 @@ class TelegramBot:
         )
 
     async def shutdown(self) -> None:
-        """Release all resources.  Safe to call even if ``run()`` failed."""
+        """Release all resources. Safe to call even if run() failed."""
         errors: list[str] = []
         for label, coro in [
             ("HA session", self._ha.close()),
@@ -597,267 +339,6 @@ class TelegramBot:
             logger.warning("Shutdown warnings: %s", "; ".join(errors))
         logger.info("Shutdown complete")
 
-    # -- helpers --
-
-    def _build_keyboard(self) -> InlineKeyboardMarkup:
-        """Build (and cache) the main inline keyboard from config."""
-        if self._keyboard is not None:
-            return self._keyboard
-
-        rows: list[list[InlineKeyboardButton]] = []
-        c = self._config
-
-        if c.light_entity_id:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="💡 Light ON", callback_data="light_on"
-                    ),
-                    InlineKeyboardButton(
-                        text="🌑 Light OFF", callback_data="light_off"
-                    ),
-                ]
-            )
-        if c.vacuum_entity_id:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="🤖 Vacuum Start", callback_data="vacuum_start"
-                    ),
-                    InlineKeyboardButton(
-                        text="🏠 Vacuum Dock", callback_data="vacuum_dock"
-                    ),
-                ]
-            )
-        if c.goodnight_scene_id:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="🌙 Good Night", callback_data="scene_goodnight"
-                    ),
-                ]
-            )
-
-        self._keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
-        return self._keyboard
-
-    def _is_authorized_chat(self, chat_id: int) -> bool:
-        return chat_id == self._config.allowed_chat_id
-
-    def _is_authorized_user(self, user_id: int) -> bool:
-        return bool(self._config.allowed_user_ids) and (
-            user_id in self._config.allowed_user_ids
-        )
-
-    @staticmethod
-    def _extract_user(obj: Message | CallbackQuery) -> tuple[int | None, str]:
-        """Return ``(user_id, username)`` — safe when ``from_user`` is None."""
-        user = obj.from_user
-        if user is None:
-            return None, "<unknown>"
-        name = user.username or user.first_name or str(user.id)
-        return user.id, name
-
-    # -- handlers --
-
-    async def _cmd_start(self, message: Message) -> None:
-        user_id, username = self._extract_user(message)
-        if user_id is None:
-            return  # channel post / anonymous
-        chat_id = message.chat.id
-
-        if not self._is_authorized_chat(chat_id):
-            await _audit(
-                self._db,
-                chat_id=chat_id,
-                user_id=user_id,
-                username=username,
-                action="/start",
-                success=False,
-                error="Unauthorized chat",
-            )
-            await message.answer("⛔ Unauthorized chat.")
-            return
-
-        await _audit(
-            self._db,
-            chat_id=chat_id,
-            user_id=user_id,
-            username=username,
-            action="/start",
-            success=True,
-        )
-
-        help_text = (
-            "🏠 <b>Home Assistant Bot</b>\n\n"
-            "Commands:\n"
-            "/start — Help & main menu\n"
-            "/status — Entity states\n\n"
-            "Use the buttons below to control devices:"
-        )
-        await message.answer(
-            help_text, parse_mode="HTML", reply_markup=self._build_keyboard()
-        )
-
-    async def _cmd_status(self, message: Message) -> None:
-        user_id, username = self._extract_user(message)
-        if user_id is None:
-            return
-        chat_id = message.chat.id
-
-        if not self._is_authorized_chat(chat_id):
-            await _audit(
-                self._db,
-                chat_id=chat_id,
-                user_id=user_id,
-                username=username,
-                action="/status",
-                success=False,
-                error="Unauthorized chat",
-            )
-            await message.answer("⛔ Unauthorized chat.")
-            return
-
-        await _audit(
-            self._db,
-            chat_id=chat_id,
-            user_id=user_id,
-            username=username,
-            action="/status",
-            success=True,
-        )
-
-        if not self._config.status_entities:
-            await message.answer("No entities configured for status display.")
-            return
-
-        lines: list[str] = ["<b>Entity Status:</b>\n"]
-        for eid in self._config.status_entities:
-            state = await self._ha.get_state(eid)
-            if state:
-                name = state.get("attributes", {}).get("friendly_name", eid)
-                lines.append(
-                    f"• {name}: <code>{state.get('state', 'unknown')}</code>"
-                )
-            else:
-                lines.append(f"• {eid}: <code>unavailable</code>")
-
-        await message.answer("\n".join(lines), parse_mode="HTML")
-
-    async def _handle_callback(self, callback: CallbackQuery) -> None:
-        # Guard: inaccessible / expired message
-        if callback.message is None:
-            await callback.answer("Message expired.", show_alert=True)
-            return
-
-        chat_id = callback.message.chat.id
-        user_id, username = self._extract_user(callback)
-        if user_id is None:
-            await callback.answer("Cannot identify user.", show_alert=True)
-            return
-
-        action = callback.data or ""
-
-        # Validate callback_data
-        if action not in KNOWN_ACTIONS:
-            await callback.answer("Unknown action.", show_alert=True)
-            return
-
-        # --- authorisation ---
-        if not self._is_authorized_chat(chat_id):
-            await _audit(
-                self._db,
-                chat_id=chat_id,
-                user_id=user_id,
-                username=username,
-                action=action,
-                success=False,
-                error="Unauthorized chat",
-            )
-            await callback.answer("⛔ Unauthorized chat.", show_alert=True)
-            return
-
-        if not self._is_authorized_user(user_id):
-            await _audit(
-                self._db,
-                chat_id=chat_id,
-                user_id=user_id,
-                username=username,
-                action=action,
-                success=False,
-                error="Unauthorized user",
-            )
-            await callback.answer(
-                "⛔ You are not authorized.", show_alert=True
-            )
-            return
-
-        # --- rate limits (global FIRST, then per-user cooldown) ---
-        if not self._global_rl.check():
-            await _audit(
-                self._db,
-                chat_id=chat_id,
-                user_id=user_id,
-                username=username,
-                action=action,
-                success=False,
-                error="Global rate limit",
-            )
-            await callback.answer(
-                "🚦 Rate limit reached. Wait a moment.", show_alert=True
-            )
-            return
-
-        allowed, remaining = await self._db.check_and_update_cooldown(
-            user_id, action, self._config.cooldown_seconds
-        )
-        if not allowed:
-            await callback.answer(
-                f"⏱️ Wait {remaining:.1f}s.", show_alert=True
-            )
-            return
-
-        # --- execute ---
-        success, err_msg = await self._execute_action(action)
-        await _audit(
-            self._db,
-            chat_id=chat_id,
-            user_id=user_id,
-            username=username,
-            action=action,
-            success=success,
-            error=err_msg if not success else None,
-        )
-
-        if success:
-            _, _, _, ok_msg = _ACTION_MAP[action]
-            await callback.answer(ok_msg)
-            try:
-                await callback.message.edit_reply_markup(
-                    reply_markup=self._build_keyboard()
-                )
-            except (TelegramBadRequest, TelegramRetryAfter):
-                pass  # message too old or Telegram rate-limited
-        else:
-            await callback.answer(
-                f"Error: {err_msg[:180]}", show_alert=True
-            )
-
-    async def _execute_action(self, action: str) -> tuple[bool, str]:
-        """Dispatch to HA service call.  Returns ``(success, error_or_empty)``."""
-        entry = _ACTION_MAP.get(action)
-        if entry is None:
-            return False, f"Unknown action: {action}"
-
-        domain, service, config_attr, _ = entry
-        entity_id: str = getattr(self._config, config_attr, "")
-        if not entity_id:
-            return False, f"{config_attr} not configured"
-
-        return await self._ha.call_service(
-            domain, service, {"entity_id": entity_id}
-        )
-
 
 # ---------------------------------------------------------------------------
 # Entrypoint
@@ -865,12 +346,12 @@ class TelegramBot:
 
 
 async def main() -> None:
-    logger.info("Loading configuration…")
+    logger.info("Loading configuration...")
     config, supervisor_token = _load_and_validate_config()
 
     bot = TelegramBot(config, supervisor_token)
     try:
-        await bot.run()  # blocks until SIGTERM / SIGINT (handled by aiogram)
+        await bot.run()
     except asyncio.CancelledError:
         logger.info("Cancelled — shutting down")
     except Exception:

@@ -12,7 +12,7 @@ WORKDIR /app
 COPY app/requirements.txt /app/
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-COPY app/app.py /app/
+COPY app/ /app/
 COPY run.sh /
 
 # Make run.sh executable

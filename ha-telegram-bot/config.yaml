@@ -1,7 +1,7 @@
 name: "Home Assistant Telegram Bot"
-version: "1.0.0"
+version: "2.0.0"
 slug: ha_telegram_bot
-description: "Custom Telegram bot to control Home Assistant with security, rate limiting, and audit logging"
+description: "Interactive Telegram bot with multi-level menus, dynamic device discovery, and vacuum room targeting for Home Assistant"
 arch:
   - aarch64
   - armv7
@@ -20,6 +20,24 @@ options:
   global_rate_limit_actions: 10
   global_rate_limit_window: 5
   status_entities: []
+  menu_domains_allowlist:
+    - light
+    - switch
+    - vacuum
+    - scene
+    - script
+    - climate
+    - fan
+    - cover
+  menu_page_size: 8
+  show_all_enabled: false
+  vacuum_room_strategy: "service_data"
+  vacuum_room_script_entity_id: ""
+  vacuum_room_presets:
+    - bathroom
+    - kitchen
+    - living_room
+    - bedroom
   light_entity_id: ""
   vacuum_entity_id: ""
   goodnight_scene_id: ""
@@ -27,12 +45,20 @@ options:
 schema:
   bot_token: password
   allowed_chat_id: int
-  allowed_user_ids: 
+  allowed_user_ids:
     - int
   cooldown_seconds: int(1,60)
   global_rate_limit_actions: int(1,100)
   global_rate_limit_window: int(1,60)
   status_entities:
+    - str
+  menu_domains_allowlist:
+    - str
+  menu_page_size: int(1,20)
+  show_all_enabled: bool
+  vacuum_room_strategy: str
+  vacuum_room_script_entity_id: str
+  vacuum_room_presets:
     - str
   light_entity_id: str
   vacuum_entity_id: str
