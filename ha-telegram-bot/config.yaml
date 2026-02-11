@@ -3,6 +3,7 @@ version: "2.0.0"
 slug: ha_telegram_bot
 description: "Interactive Telegram bot with multi-level menus, dynamic device discovery, and vacuum room targeting for Home Assistant"
 arch:
+  - amd64
   - aarch64
   - armv7
 startup: application
