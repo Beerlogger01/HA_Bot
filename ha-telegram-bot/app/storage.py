@@ -9,6 +9,12 @@ Tables:
 - entity_area_cache: cached entity->area->floor mapping from registry
 - vacuum_room_map: vacuum segment_id <-> area mapping
 - notifications: per-user entity notification preferences
+- user_roles: role-based access control (admin/user/guest)
+- favorites_actions: per-user favorite actions (not just entities)
+- snapshots: entity state snapshots for diff
+- schedules: scheduled actions with cron expressions
+- error_log: ring buffer for /trace_last_error diagnostics
+- mutes: per-user per-entity notification muting
 """
 
 from __future__ import annotations
@@ -116,6 +122,63 @@ class Database:
                    mode             TEXT    NOT NULL DEFAULT 'state_only',
                    throttle_seconds INTEGER NOT NULL DEFAULT 60,
                    last_sent_ts     REAL    NOT NULL DEFAULT 0,
+                   PRIMARY KEY (user_id, entity_id)
+               )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS user_roles (
+                   user_id INTEGER PRIMARY KEY,
+                   role    TEXT NOT NULL DEFAULT 'user'
+               )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS favorites_actions (
+                   id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                   user_id      INTEGER NOT NULL,
+                   action_type  TEXT    NOT NULL,
+                   payload_json TEXT    NOT NULL DEFAULT '{}',
+                   label        TEXT    NOT NULL DEFAULT '',
+                   created_at   REAL   NOT NULL
+               )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS snapshots (
+                   id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                   user_id      INTEGER NOT NULL,
+                   name         TEXT    NOT NULL,
+                   created_at   TEXT    NOT NULL,
+                   payload_json TEXT    NOT NULL DEFAULT '[]'
+               )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS schedules (
+                   id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                   user_id      INTEGER NOT NULL,
+                   name         TEXT    NOT NULL,
+                   action_type  TEXT    NOT NULL,
+                   payload_json TEXT    NOT NULL DEFAULT '{}',
+                   cron_expr    TEXT    NOT NULL,
+                   next_run     REAL   NOT NULL DEFAULT 0,
+                   enabled      INTEGER NOT NULL DEFAULT 1,
+                   last_run     REAL,
+                   last_result  TEXT
+               )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS error_log (
+                   id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                   timestamp TEXT    NOT NULL,
+                   level     TEXT    NOT NULL,
+                   module    TEXT    NOT NULL DEFAULT '',
+                   message   TEXT    NOT NULL,
+                   traceback TEXT
+               )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS mutes (
+                   user_id    INTEGER NOT NULL,
+                   entity_id  TEXT    NOT NULL,
+                   mute_until REAL   NOT NULL,
                    PRIMARY KEY (user_id, entity_id)
                )"""
         )
@@ -480,3 +543,391 @@ class Database:
                 "aliases": aliases,
             })
         return result
+
+    # --- user_roles ---
+
+    async def get_user_role(self, user_id: int) -> str:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT role FROM user_roles WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else "user"
+
+    async def set_user_role(self, user_id: int, role: str) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO user_roles (user_id, role) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET role = excluded.role",
+            (user_id, role),
+        )
+        await self._db.commit()
+
+    async def get_all_roles(self) -> list[dict[str, Any]]:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT user_id, role FROM user_roles ORDER BY user_id"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [{"user_id": r[0], "role": r[1]} for r in rows]
+
+    # --- favorites_actions ---
+
+    async def add_favorite_action(
+        self, user_id: int, action_type: str, payload: dict[str, Any], label: str,
+    ) -> int:
+        assert self._db is not None
+        now = time.time()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        async with self._db.execute(
+            "INSERT INTO favorites_actions (user_id, action_type, payload_json, label, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, action_type, payload_json, label, now),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._db.commit()
+        return row_id or 0
+
+    async def get_favorite_actions(self, user_id: int) -> list[dict[str, Any]]:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT id, action_type, payload_json, label, created_at "
+            "FROM favorites_actions WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for r in rows:
+            try:
+                payload = json.loads(r[2])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            result.append({
+                "id": r[0], "action_type": r[1], "payload": payload,
+                "label": r[3], "created_at": r[4],
+            })
+        return result
+
+    async def remove_favorite_action(self, user_id: int, action_id: int) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "DELETE FROM favorites_actions WHERE id = ? AND user_id = ?",
+            (action_id, user_id),
+        ) as cur:
+            deleted = cur.rowcount > 0
+        await self._db.commit()
+        return deleted
+
+    # --- snapshots ---
+
+    async def save_snapshot(
+        self, user_id: int, name: str, payload: list[dict[str, Any]],
+    ) -> int:
+        assert self._db is not None
+        ts = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        async with self._db.execute(
+            "INSERT INTO snapshots (user_id, name, created_at, payload_json) VALUES (?, ?, ?, ?)",
+            (user_id, name, ts, payload_json),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._db.commit()
+        return row_id or 0
+
+    async def get_snapshots(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT id, name, created_at, payload_json FROM snapshots "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for r in rows:
+            try:
+                payload = json.loads(r[3])
+            except (json.JSONDecodeError, TypeError):
+                payload = []
+            result.append({
+                "id": r[0], "name": r[1], "created_at": r[2], "payload": payload,
+            })
+        return result
+
+    async def get_snapshot(self, snapshot_id: int) -> dict[str, Any] | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT id, user_id, name, created_at, payload_json FROM snapshots WHERE id = ?",
+            (snapshot_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row[4])
+        except (json.JSONDecodeError, TypeError):
+            payload = []
+        return {
+            "id": row[0], "user_id": row[1], "name": row[2],
+            "created_at": row[3], "payload": payload,
+        }
+
+    async def delete_snapshot(self, snapshot_id: int, user_id: int) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "DELETE FROM snapshots WHERE id = ? AND user_id = ?",
+            (snapshot_id, user_id),
+        ) as cur:
+            deleted = cur.rowcount > 0
+        await self._db.commit()
+        return deleted
+
+    # --- schedules ---
+
+    async def add_schedule(
+        self, user_id: int, name: str, action_type: str,
+        payload: dict[str, Any], cron_expr: str, next_run: float,
+    ) -> int:
+        assert self._db is not None
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        async with self._db.execute(
+            "INSERT INTO schedules (user_id, name, action_type, payload_json, cron_expr, next_run) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, name, action_type, payload_json, cron_expr, next_run),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._db.commit()
+        return row_id or 0
+
+    async def get_schedules(self, user_id: int | None = None) -> list[dict[str, Any]]:
+        assert self._db is not None
+        if user_id is not None:
+            sql = ("SELECT id, user_id, name, action_type, payload_json, cron_expr, "
+                   "next_run, enabled, last_run, last_result "
+                   "FROM schedules WHERE user_id = ? ORDER BY next_run")
+            params: tuple[Any, ...] = (user_id,)
+        else:
+            sql = ("SELECT id, user_id, name, action_type, payload_json, cron_expr, "
+                   "next_run, enabled, last_run, last_result "
+                   "FROM schedules WHERE enabled = 1 ORDER BY next_run")
+            params = ()
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for r in rows:
+            try:
+                payload = json.loads(r[4])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            result.append({
+                "id": r[0], "user_id": r[1], "name": r[2], "action_type": r[3],
+                "payload": payload, "cron_expr": r[5], "next_run": r[6],
+                "enabled": bool(r[7]), "last_run": r[8], "last_result": r[9],
+            })
+        return result
+
+    async def get_due_schedules(self, now: float) -> list[dict[str, Any]]:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT id, user_id, name, action_type, payload_json, cron_expr, next_run "
+            "FROM schedules WHERE enabled = 1 AND next_run <= ? ORDER BY next_run",
+            (now,),
+        ) as cur:
+            rows = await cur.fetchall()
+        result = []
+        for r in rows:
+            try:
+                payload = json.loads(r[4])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            result.append({
+                "id": r[0], "user_id": r[1], "name": r[2], "action_type": r[3],
+                "payload": payload, "cron_expr": r[5], "next_run": r[6],
+            })
+        return result
+
+    async def update_schedule_run(
+        self, schedule_id: int, next_run: float, result_text: str,
+    ) -> None:
+        assert self._db is not None
+        now = time.time()
+        await self._db.execute(
+            "UPDATE schedules SET last_run = ?, last_result = ?, next_run = ? WHERE id = ?",
+            (now, result_text, next_run, schedule_id),
+        )
+        await self._db.commit()
+
+    async def toggle_schedule(self, schedule_id: int, user_id: int) -> bool | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT enabled FROM schedules WHERE id = ? AND user_id = ?",
+            (schedule_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        new_val = 0 if row[0] else 1
+        await self._db.execute(
+            "UPDATE schedules SET enabled = ? WHERE id = ?",
+            (new_val, schedule_id),
+        )
+        await self._db.commit()
+        return bool(new_val)
+
+    async def delete_schedule(self, schedule_id: int, user_id: int) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "DELETE FROM schedules WHERE id = ? AND user_id = ?",
+            (schedule_id, user_id),
+        ) as cur:
+            deleted = cur.rowcount > 0
+        await self._db.commit()
+        return deleted
+
+    # --- error_log ---
+
+    _ERROR_LOG_MAX = 200
+
+    async def log_error(
+        self, level: str, module: str, message: str, traceback_str: str | None = None,
+    ) -> None:
+        assert self._db is not None
+        ts = datetime.now(timezone.utc).isoformat()
+        await self._db.execute(
+            "INSERT INTO error_log (timestamp, level, module, message, traceback) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ts, level, module, message, traceback_str),
+        )
+        # Trim ring buffer
+        await self._db.execute(
+            "DELETE FROM error_log WHERE id NOT IN "
+            "(SELECT id FROM error_log ORDER BY id DESC LIMIT ?)",
+            (self._ERROR_LOG_MAX,),
+        )
+        await self._db.commit()
+
+    async def get_recent_errors(self, limit: int = 10) -> list[dict[str, Any]]:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT id, timestamp, level, module, message, traceback "
+            "FROM error_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": r[0], "timestamp": r[1], "level": r[2],
+                "module": r[3], "message": r[4], "traceback": r[5],
+            }
+            for r in rows
+        ]
+
+    # --- mutes ---
+
+    async def set_mute(self, user_id: int, entity_id: str, mute_until: float) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO mutes (user_id, entity_id, mute_until) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, entity_id) DO UPDATE SET mute_until = excluded.mute_until",
+            (user_id, entity_id, mute_until),
+        )
+        await self._db.commit()
+
+    async def is_muted(self, user_id: int, entity_id: str) -> bool:
+        assert self._db is not None
+        now = time.time()
+        async with self._db.execute(
+            "SELECT mute_until FROM mutes WHERE user_id = ? AND entity_id = ?",
+            (user_id, entity_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return False
+        if row[0] <= now:
+            # Mute expired, clean up
+            await self._db.execute(
+                "DELETE FROM mutes WHERE user_id = ? AND entity_id = ?",
+                (user_id, entity_id),
+            )
+            await self._db.commit()
+            return False
+        return True
+
+    async def remove_mute(self, user_id: int, entity_id: str) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM mutes WHERE user_id = ? AND entity_id = ?",
+            (user_id, entity_id),
+        )
+        await self._db.commit()
+
+    async def get_user_mutes(self, user_id: int) -> list[dict[str, Any]]:
+        assert self._db is not None
+        now = time.time()
+        # Clean expired mutes first
+        await self._db.execute(
+            "DELETE FROM mutes WHERE user_id = ? AND mute_until <= ?",
+            (user_id, now),
+        )
+        await self._db.commit()
+        async with self._db.execute(
+            "SELECT entity_id, mute_until FROM mutes WHERE user_id = ? ORDER BY entity_id",
+            (user_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [{"entity_id": r[0], "mute_until": r[1]} for r in rows]
+
+    # --- export/import helpers ---
+
+    async def export_user_settings(self, user_id: int) -> dict[str, Any]:
+        """Export all user-specific settings for backup."""
+        favorites = await self.get_favorites(user_id)
+        fav_actions = await self.get_favorite_actions(user_id)
+        notifs = await self.get_user_notifications(user_id)
+        role = await self.get_user_role(user_id)
+        schedules = await self.get_schedules(user_id)
+        return {
+            "user_id": user_id,
+            "role": role,
+            "favorites": favorites,
+            "favorite_actions": fav_actions,
+            "notifications": notifs,
+            "schedules": [
+                {"name": s["name"], "action_type": s["action_type"],
+                 "payload": s["payload"], "cron_expr": s["cron_expr"],
+                 "enabled": s["enabled"]}
+                for s in schedules
+            ],
+        }
+
+    async def import_user_settings(self, user_id: int, data: dict[str, Any]) -> int:
+        """Import user settings from backup. Returns count of imported items."""
+        assert self._db is not None
+        count = 0
+
+        # Favorites
+        for eid in data.get("favorites", []):
+            if isinstance(eid, str) and "." in eid:
+                is_fav = await self.is_favorite(user_id, eid)
+                if not is_fav:
+                    await self._db.execute(
+                        "INSERT OR IGNORE INTO favorites (user_id, entity_id) VALUES (?, ?)",
+                        (user_id, eid),
+                    )
+                    count += 1
+
+        # Notifications
+        for notif in data.get("notifications", []):
+            eid = notif.get("entity_id", "")
+            if eid:
+                existing = await self.get_notification(user_id, eid)
+                if existing is None:
+                    mode = notif.get("mode", "state_only")
+                    await self._db.execute(
+                        "INSERT INTO notifications (user_id, entity_id, enabled, mode, throttle_seconds, last_sent_ts) "
+                        "VALUES (?, ?, 1, ?, 60, 0)",
+                        (user_id, eid, mode),
+                    )
+                    count += 1
+
+        await self._db.commit()
+        return count
