@@ -1,6 +1,6 @@
 # Home Assistant Telegram Bot Add-on
 
-A secure, interactive Telegram bot for controlling Home Assistant devices. Features floors/areas navigation, vacuum room targeting, Roborock routines, per-user favorites, entity notifications, and dynamic device discovery.
+A secure, interactive Telegram bot for controlling Home Assistant devices. Features floors/areas navigation, vacuum room targeting, Roborock routines, per-user favorites, entity notifications, global search, state snapshots with diff, cron-based scheduler, diagnostics, role-based access control, and dynamic device discovery.
 
 ## Features
 
@@ -8,8 +8,15 @@ A secure, interactive Telegram bot for controlling Home Assistant devices. Featu
 - **Dynamic device discovery**: Entities organized by floors -> areas -> devices with domain filtering
 - **Vacuum room targeting**: Segment-based cleaning with auto-detection + configurable presets
 - **Roborock routines**: Automatic discovery of routine button entities on vacuum devices
-- **Per-user favorites**: Star entities for quick access
-- **Entity notifications**: Subscribe to state changes with throttling and mode selection
+- **Per-user favorites**: Star entities and save quick actions for instant access
+- **Entity notifications**: Subscribe to state changes with actionable inline buttons and per-entity mute
+- **Global search**: Find entities by name or ID via `/search` command or inline menu
+- **State snapshots**: Save and compare system state with `/snapshot` and diff view
+- **Cron scheduler**: Schedule periodic HA service calls with cron expressions
+- **Diagnostics**: `/health`, `/diag`, `/trace` commands for system monitoring
+- **Role-based access control**: Admin / User / Guest hierarchy with write-action guards
+- **Settings export/import**: Backup and restore per-user favorites, notifications, and actions
+- **Forum supergroup support**: Proper message_thread_id handling for topic-based chats
 - **Clean message behavior**: Edit-in-place menus, no message clutter
 - **Security**: Whitelist-based chat and user authorization, deny-by-default
 - **Rate limiting**: Per-user cooldowns and global rate limits
@@ -148,6 +155,7 @@ Expected log output:
 [INFO] Registry sync OK: N floors, N areas, N devices, N entities
 [INFO] Vacuum vacuum.roborock: N routines
 [INFO] Notification listener started
+[INFO] Scheduler started (check every 30s)
 [INFO] Bot initialized — @your_bot (id=123456789)
 [INFO] Bot polling started
 ```
@@ -160,14 +168,28 @@ Expected log output:
 - `/menu` — Show main menu (alias for /start)
 - `/status` — Show status of configured entities
 - `/ping` — Liveness check (pong + HA version + timestamp)
+- `/search <query>` — Search entities by name or ID
+- `/snapshot [name]` — Save a state snapshot of all entities
+- `/snapshots` — List saved snapshots
+- `/schedule` — List scheduled tasks
+- `/schedule add <name> | <cron> | <domain.service> | <entity_id>` — Create scheduled task
+- `/health` — Quick system health check
+- `/diag` — Full diagnostics (admin only)
+- `/trace` — Last error traceback (admin only)
+- `/role [user_id] [role]` — Manage user roles (admin only)
+- `/export_settings` — Export your favorites and notification settings as JSON
+- `/import_settings <json>` — Import settings from JSON
+- `/notify_test` — Test notification delivery
 
 ### Main Menu
 
-The main menu provides five categories:
+The main menu provides eight categories:
 
 - **Управление** — Browse devices by Floors -> Areas -> Entities with domain-specific controls
-- **Избранное** — Quick access to starred entities
+- **Избранное** — Quick access to starred entities and saved quick actions
 - **Уведомления** — Manage state change subscriptions
+- **Поиск** — Search entities by name or ID
+- **Расписание** — View and manage scheduled tasks
 - **Обновить** — Re-sync floors, areas, devices, entities from HA
 - **Статус** — View current state of configured entities
 
@@ -183,9 +205,13 @@ Main Menu
 │       ├── Area 1 -> Entities -> Controls
 │       └── Без комнаты -> Unassigned entities
 ├── Избранное -> Starred entities -> Controls
+│   └── Быстрые действия -> Run / Delete saved actions
 ├── Уведомления -> Subscribed entities -> Toggle/Mode
+├── Поиск -> Type query -> Results -> Entity controls
+├── Расписание -> List / Toggle / Delete scheduled tasks
 ├── Обновить -> Re-sync registries
-└── Статус -> Status entities
+├── Статус -> Status entities
+└── Снимки -> Snapshot list -> Detail / Diff / Delete
 ```
 
 All menus use **edit-in-place**: pressing a button updates the existing message instead of sending a new one.
@@ -271,9 +297,64 @@ The bot automatically discovers Roborock routine button entities by finding `but
 - **Modes**:
   - `state_only` (default) — Only notify when the state value changes
   - `state_and_key_attrs` — Also notify on key attribute changes (battery, temperature, etc.)
+- **Actionable buttons**: Notification messages include domain-specific action buttons (e.g., ON/OFF for lights, Dock/Locate/Pause for vacuums)
+- **Mute**: 1-hour per-entity mute button on each notification message
 - **Throttling**: Minimum 60 seconds between notifications per entity per user
 - Notifications are sent as a separate message (not in the menu)
-- Persistent WebSocket connection to HA for real-time event processing
+- Persistent WebSocket connection to HA with exponential backoff reconnect
+
+## Search
+
+- Search for any entity by name or entity_id
+- Accessible via `/search <query>` command or the Search button in main menu
+- In search mode, plain text messages are treated as search queries
+- Results are paginated and each entity links to its full control card
+
+## State Snapshots
+
+- Save a point-in-time snapshot of all entity states with `/snapshot [name]`
+- List saved snapshots with `/snapshots` or the Snapshots menu
+- View snapshot details including entity count and creation time
+- **Diff**: Compare a snapshot against current live state to see what changed
+- Delete snapshots when no longer needed
+
+## Scheduler
+
+- Schedule periodic HA service calls using cron expressions
+- Create: `/schedule add Morning | 0 7 * * * | light.turn_on | light.bedroom`
+- List, toggle, and delete schedules from the menu or with `/schedule`
+- Cron format: `minute hour day month weekday` (5 fields)
+- Background task checks due schedules every 30 seconds
+- Invalid cron expressions auto-disable the schedule
+
+## Diagnostics
+
+- `/health` — Quick system health check (HA reachable, registry synced, uptime)
+- `/diag` — Full diagnostics panel with refresh and last error trace (admin only)
+- `/trace` — View the last application error with full traceback (admin only)
+- `/notify_test` — Test notification delivery to your chat
+- Errors are captured from the application logger and stored in SQLite
+
+## Role-Based Access Control
+
+Three roles with hierarchical permissions:
+
+| Role | Level | Permissions |
+|------|-------|-------------|
+| `admin` | 3 | All commands including `/diag`, `/trace`, `/role` |
+| `user` | 2 | All read + write actions (toggle, control, favorites) |
+| `guest` | 1 | Read-only access (browse menus, view status) |
+
+- Default role for new users: `user`
+- Admins manage roles via `/role <user_id> <role>`
+- Write actions (device control, favorites, notifications) require at least `user` role
+- Guests can browse and view but cannot control devices
+
+## Settings Export/Import
+
+- Export all your favorites, notification subscriptions, and quick actions as JSON
+- Import settings to a new account or restore from backup
+- Commands: `/export_settings` and `/import_settings <json>`
 
 ## Security Features
 
@@ -300,13 +381,19 @@ The bot is built with a modular architecture:
 
 ```
 app/
-  app.py           — Main entrypoint, config loading, bot lifecycle
-  api.py           — Home Assistant REST API client with retries
-  registry.py      — HA WebSocket registry sync (floors/areas/devices/entities)
-  notifications.py — State change notification system (WS subscribe + dispatch)
-  storage.py       — SQLite database (8 tables)
-  handlers.py      — Telegram command and callback handlers with route table
-  ui.py            — Inline keyboard menu builders
+  app.py              — Main entrypoint, config loading, bot lifecycle
+  api.py              — Home Assistant REST API client with retries
+  registry.py         — HA WebSocket registry sync (floors/areas/devices/entities)
+  handlers.py         — Telegram command and callback handlers with route table
+  ui.py               — Inline keyboard menu builders
+  notifications.py    — State change notifications (WS subscribe + actionable alerts)
+  storage.py          — SQLite database (14 tables)
+  scheduler.py        — Cron-based periodic task execution
+  diagnostics.py      — Health checks, debug info, error tracing
+  vacuum_adapter.py   — Vacuum capabilities, segment cleaning, routines
+
+tests/
+  test_core.py        — Unit tests (pytest + pytest-asyncio)
 ```
 
 ## Database Tables
@@ -321,6 +408,12 @@ app/
 | `entity_area_cache` | Cached entity->area->floor mapping from registry |
 | `vacuum_room_map` | Vacuum segment_id to area mapping |
 | `notifications` | Per-user entity notification preferences |
+| `user_roles` | Role assignments (admin / user / guest) |
+| `favorites_actions` | Saved quick actions (service calls) |
+| `snapshots` | State snapshots with JSON payload |
+| `schedules` | Cron-based scheduled tasks |
+| `error_log` | Application error history for diagnostics |
+| `mutes` | Per-user per-entity notification mutes with expiry |
 
 ## Troubleshooting
 
