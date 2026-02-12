@@ -2,11 +2,15 @@
 
 Full menu navigation: Floors -> Areas -> Entities -> Controls.
 Favorites, notifications, vacuum routines, segment cleaning.
+Search, snapshots, scheduler, diagnostics, roles, export/import.
 Edit-in-place message management, security checks, rate limiting.
+Role-based access control (admin / user / guest).
+Forum supergroup thread support (message_thread_id).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -18,22 +22,33 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from api import HAClient
+from diagnostics import Diagnostics
 from registry import HARegistry
+from scheduler import Scheduler, next_cron_time, validate_cron
 from storage import Database
 from ui import (
     build_areas_menu,
     build_confirmation,
+    build_diagnostics_menu,
     build_entity_control,
     build_entity_list,
+    build_fav_actions_menu,
     build_favorites_menu,
     build_floors_menu,
     build_help_menu,
     build_main_menu,
     build_notif_list,
+    build_roles_list,
+    build_schedule_list,
+    build_search_prompt,
+    build_search_results,
+    build_snapshot_detail,
+    build_snapshots_list,
     build_status_menu,
     build_vacuum_rooms,
     build_vacuum_routines,
 )
+from vacuum_adapter import VacuumAdapter
 
 logger = logging.getLogger("ha_bot.handlers")
 
@@ -48,6 +63,15 @@ _ALLOWED_SERVICES: frozenset[str] = frozenset({
 })
 
 _ENTITY_ID_RE = re.compile(r"^[a-z][a-z0-9_]*\.[a-z0-9][a-z0-9_\-]*$")
+
+# Role hierarchy levels
+_ROLE_LEVELS: dict[str, int] = {"admin": 3, "user": 2, "guest": 1}
+
+# Write-action callback prefixes that require at least "user" role
+_WRITE_PREFIXES: frozenset[str] = frozenset({
+    "act", "bright", "clim", "fav", "ntog", "vseg", "vcmd", "rtn",
+    "nact", "nmute", "fa_run", "fa_del", "schtog", "schdel", "snapdel",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +130,7 @@ class Handlers:
     def __init__(
         self, *, bot: Bot, ha: HAClient, db: Database,
         config: Any, global_rl: GlobalRateLimiter, registry: HARegistry,
+        vacuum: VacuumAdapter, diagnostics: Diagnostics, scheduler: Scheduler,
     ) -> None:
         self._bot = bot
         self._ha = ha
@@ -113,7 +138,13 @@ class Handlers:
         self._cfg = config
         self._rl = global_rl
         self._reg = registry
+        self._vac = vacuum
+        self._diag = diagnostics
+        self._sched = scheduler
         self.ha_version: str = "unknown"
+
+        # In-memory search result cache: chat_id -> entity list
+        self._search_cache: dict[int, list[dict[str, Any]]] = {}
 
     # -----------------------------------------------------------------------
     # Security
@@ -125,12 +156,24 @@ class Handlers:
     def _is_authorized_user(self, user_id: int) -> bool:
         return not self._cfg.allowed_user_ids or user_id in self._cfg.allowed_user_ids
 
+    async def _check_role(self, user_id: int, min_role: str) -> bool:
+        """Check if user has at least min_role level."""
+        role = await self._db.get_user_role(user_id)
+        return _ROLE_LEVELS.get(role, 2) >= _ROLE_LEVELS.get(min_role, 2)
+
     @staticmethod
     def _extract_user(obj: Message | CallbackQuery) -> tuple[int | None, str]:
         user = obj.from_user
         if user is None:
             return None, "<unknown>"
         return user.id, user.username or user.first_name or str(user.id)
+
+    @staticmethod
+    def _get_thread_id(msg: Message) -> int | None:
+        """Extract thread_id for forum supergroups."""
+        if msg.is_topic_message and msg.message_thread_id:
+            return msg.message_thread_id
+        return None
 
     # -----------------------------------------------------------------------
     # Message management
@@ -140,6 +183,7 @@ class Handlers:
         self, chat_id: int, text: str, kb: InlineKeyboardMarkup, *,
         source: Message | None = None,
         menu: str = "main", entity: str | None = None, room: str | None = None,
+        thread_id: int | None = None,
     ) -> None:
         msg_id = await self._db.get_menu_message_id(chat_id)
 
@@ -167,9 +211,13 @@ class Handlers:
                 pass
 
         try:
-            sent = await self._bot.send_message(
-                chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=kb,
-            )
+            kwargs: dict[str, Any] = {
+                "chat_id": chat_id, "text": text,
+                "parse_mode": "HTML", "reply_markup": kb,
+            }
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+            sent = await self._bot.send_message(**kwargs)
             await self._db.save_menu_state(chat_id, sent.message_id, menu, entity, room)
         except TelegramRetryAfter as e:
             logger.warning("Rate limited on send %ss", e.retry_after)
@@ -209,7 +257,8 @@ class Handlers:
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="/start", success=True)
         text, kb = build_main_menu()
-        await self._send_or_edit(cid, text, kb, source=message, menu="main")
+        tid = self._get_thread_id(message)
+        await self._send_or_edit(cid, text, kb, source=message, menu="main", thread_id=tid)
 
     async def cmd_status(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
@@ -223,11 +272,278 @@ class Handlers:
                      action="/status", success=True)
         entities = await self._fetch_status_entities()
         text, kb = build_status_menu(entities)
-        await self._send_or_edit(cid, text, kb, source=message, menu="status")
+        tid = self._get_thread_id(message)
+        await self._send_or_edit(cid, text, kb, source=message, menu="status", thread_id=tid)
 
     async def cmd_ping(self, message: Message) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         await message.answer(f"pong  |  HA {self.ha_version}  |  {ts}")
+
+    async def cmd_search(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            await message.answer("\u26d4 Неавторизованный чат.")
+            return
+
+        # Extract query from /search <query>
+        parts = (message.text or "").split(maxsplit=1)
+        query = parts[1].strip() if len(parts) > 1 else ""
+
+        if not query:
+            text, kb = build_search_prompt()
+            tid = self._get_thread_id(message)
+            await self._send_or_edit(cid, text, kb, source=message, menu="search", thread_id=tid)
+            return
+
+        await self._do_search(cid, uid, query, message=message)
+
+    async def cmd_health(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        health = await self._diag.health_check()
+        status = health["status"]
+        icon = "\u2705" if status == "ok" else "\u26a0\ufe0f"
+        lines = [
+            f"{icon} <b>Health: {status}</b>",
+            f"HA: {health['ha_version']} ({'OK' if health['ha_reachable'] else 'FAIL'})",
+            f"Registry: {'synced' if health['registry_synced'] else 'NOT synced'}",
+            f"Uptime: {health['uptime']}",
+            f"Entities: {health['entities']}",
+        ]
+        await message.answer("\n".join(lines), parse_mode="HTML")
+
+    async def cmd_diag(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        if not await self._check_role(uid, "admin"):
+            await message.answer("\u26d4 Требуются права администратора.")
+            return
+        diag_text = await self._diag.get_diagnostics_text()
+        text, kb = build_diagnostics_menu(diag_text)
+        tid = self._get_thread_id(message)
+        await self._send_or_edit(cid, text, kb, source=message, menu="diag", thread_id=tid)
+
+    async def cmd_trace(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        if not await self._check_role(uid, "admin"):
+            await message.answer("\u26d4 Требуются права администратора.")
+            return
+        trace = await self._diag.trace_last_error()
+        await message.answer(trace, parse_mode="HTML")
+
+    async def cmd_snapshot(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+
+        parts = (message.text or "").split(maxsplit=1)
+        snap_name = parts[1].strip() if len(parts) > 1 else ""
+        if not snap_name:
+            snap_name = datetime.now(timezone.utc).strftime("snap_%Y%m%d_%H%M%S")
+
+        states = await self._ha.list_states()
+        payload = [
+            {"entity_id": s.get("entity_id", ""), "state": s.get("state", ""),
+             "attributes": s.get("attributes", {})}
+            for s in states if s.get("entity_id")
+        ]
+        snap_id = await self._db.save_snapshot(uid, snap_name, payload)
+        await message.answer(
+            f"\U0001f4f8 Снимок <b>{snap_name}</b> сохранён (#{snap_id}, {len(payload)} сущностей).",
+            parse_mode="HTML",
+        )
+
+    async def cmd_snapshots(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        snaps = await self._db.get_snapshots(uid)
+        text, kb = build_snapshots_list(snaps)
+        tid = self._get_thread_id(message)
+        await self._send_or_edit(cid, text, kb, source=message, menu="snapshots", thread_id=tid)
+
+    async def cmd_schedule(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+
+        parts = (message.text or "").split(maxsplit=1)
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        if not args or args == "list":
+            scheds = await self._db.get_schedules(uid)
+            text, kb = build_schedule_list(scheds)
+            tid = self._get_thread_id(message)
+            await self._send_or_edit(cid, text, kb, source=message, menu="schedule", thread_id=tid)
+            return
+
+        if args.startswith("add "):
+            await self._schedule_add(message, uid, args[4:].strip())
+            return
+
+        await message.answer(
+            "\u23f0 Использование:\n"
+            "/schedule — список\n"
+            '/schedule add &lt;name&gt; | &lt;cron&gt; | &lt;domain.service&gt; | &lt;entity_id&gt;\n'
+            "Пример: /schedule add Morning | 0 7 * * * | light.turn_on | light.bedroom",
+            parse_mode="HTML",
+        )
+
+    async def _schedule_add(self, message: Message, uid: int, args: str) -> None:
+        parts = [p.strip() for p in args.split("|")]
+        if len(parts) < 4:
+            await message.answer(
+                "\u274c Формат: name | cron | domain.service | entity_id",
+                parse_mode="HTML",
+            )
+            return
+
+        name, cron_expr, service_str, entity_id = parts[0], parts[1], parts[2], parts[3]
+
+        err = validate_cron(cron_expr)
+        if err:
+            await message.answer(f"\u274c Некорректный cron: {err}")
+            return
+
+        if "." not in service_str:
+            await message.answer("\u274c Сервис должен быть в формате domain.service")
+            return
+
+        domain, service = service_str.split(".", 1)
+        nr = next_cron_time(cron_expr)
+        if nr == 0.0:
+            await message.answer("\u274c Не удалось вычислить следующий запуск.")
+            return
+
+        payload = {"domain": domain, "service": service, "data": {"entity_id": entity_id}}
+        sched_id = await self._db.add_schedule(uid, name, "service_call", payload, cron_expr, nr)
+        await message.answer(
+            f"\u2705 Расписание #{sched_id} <b>{name}</b> создано.\n"
+            f"Cron: <code>{cron_expr}</code>",
+            parse_mode="HTML",
+        )
+
+    async def cmd_role(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        if not await self._check_role(uid, "admin"):
+            await message.answer("\u26d4 Требуются права администратора.")
+            return
+
+        parts = (message.text or "").split()
+        if len(parts) == 3:
+            try:
+                target_uid = int(parts[1])
+            except ValueError:
+                await message.answer("\u274c user_id должен быть числом.")
+                return
+            role = parts[2].lower()
+            if role not in ("admin", "user", "guest"):
+                await message.answer("\u274c Роль: admin / user / guest")
+                return
+            await self._db.set_user_role(target_uid, role)
+            await message.answer(f"\u2705 Пользователь {target_uid} → {role}")
+            return
+
+        roles = await self._db.get_all_roles()
+        text, kb = build_roles_list(roles)
+        tid = self._get_thread_id(message)
+        await self._send_or_edit(cid, text, kb, source=message, menu="roles", thread_id=tid)
+
+    async def cmd_export_settings(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        data = await self._db.export_user_settings(uid)
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        if len(text) > 4000:
+            text = text[:4000] + "\n... (truncated)"
+        await message.answer(f"<pre>{text}</pre>", parse_mode="HTML")
+
+    async def cmd_import_settings(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        parts = (message.text or "").split(maxsplit=1)
+        json_str = parts[1].strip() if len(parts) > 1 else ""
+        if not json_str:
+            await message.answer(
+                "Использование: /import_settings {json}\nJSON из /export_settings",
+            )
+            return
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            await message.answer(f"\u274c Некорректный JSON: {exc}")
+            return
+        count = await self._db.import_user_settings(uid, data)
+        await message.answer(f"\u2705 Импортировано: {count} записей.")
+
+    async def cmd_notify_test(self, message: Message) -> None:
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        result = await self._diag.notify_test(self._bot, cid)
+        await message.answer(result)
+
+    async def handle_text_search(self, message: Message) -> None:
+        """Handle plain text messages as search queries when in search mode."""
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            return
+        if not self._is_authorized_user(uid):
+            return
+
+        menu_state = await self._db.get_menu_state(cid)
+        if not menu_state or menu_state.get("current_menu") != "search":
+            return
+
+        query = (message.text or "").strip()
+        if not query:
+            return
+
+        await self._do_search(cid, uid, query, message=message)
 
     # -----------------------------------------------------------------------
     # Callback dispatcher
@@ -253,8 +569,14 @@ class Handlers:
             await callback.answer("\u26d4 Нет доступа.", show_alert=True)
             return
 
+        # Role check for write actions
+        prefix = data.split(":", 1)[0] if ":" in data else data
+        if prefix in _WRITE_PREFIXES:
+            if not await self._check_role(uid, "user"):
+                await callback.answer("\u26d4 Недостаточно прав (guest).", show_alert=True)
+                return
+
         try:
-            prefix = data.split(":", 1)[0] if ":" in data else data
             handler = self._ROUTES.get(prefix)
             if handler:
                 await handler(self, cid, uid, uname, data, callback)
@@ -294,14 +616,27 @@ class Handlers:
             await self._show_manage(cid)
         elif target == "favorites":
             await self._show_favorites(cid, uid, 0)
+        elif target == "fav_actions":
+            await self._show_fav_actions(cid, uid, 0)
         elif target == "notif":
             await self._show_notif_list(cid, uid, 0)
+        elif target == "search":
+            t, k = build_search_prompt()
+            await self._send_or_edit(cid, t, k, menu="search")
+        elif target == "schedule":
+            scheds = await self._db.get_schedules(uid)
+            t, k = build_schedule_list(scheds)
+            await self._send_or_edit(cid, t, k, menu="schedule")
         elif target == "refresh":
             await self._do_refresh(cid)
         elif target == "status":
             ents = await self._fetch_status_entities()
             t, k = build_status_menu(ents)
             await self._send_or_edit(cid, t, k, menu="status")
+        elif target == "snapshots":
+            snaps = await self._db.get_snapshots(uid)
+            t, k = build_snapshots_list(snaps)
+            await self._send_or_edit(cid, t, k, menu="snapshots")
         elif target == "help":
             t, k = build_help_menu()
             await self._send_or_edit(cid, t, k, menu="help")
@@ -363,7 +698,7 @@ class Handlers:
         ent_list = await self._enrich_entities(eids)
         t, k = build_entity_list(
             ent_list, 0, self._cfg.menu_page_size,
-            title=title, back_cb=f"nav:manage",
+            title=title, back_cb="nav:manage",
             page_cb_prefix=f"arp:{area_id}",
         )
         await self._send_or_edit(cid, t, k, menu=f"area:{area_id}")
@@ -438,23 +773,18 @@ class Handlers:
         domain = eid.split(".", 1)[0]
         if domain == "vacuum":
             extra_rows: list[list[InlineKeyboardButton]] = []
-            # Room cleaning button
-            segments = await self._db.get_vacuum_room_map(eid)
-            presets = list(self._cfg.vacuum_room_presets)
-            if segments or presets:
+            caps = await self._vac.get_capabilities(eid)
+            if caps.supports_segment_clean:
                 extra_rows.append([InlineKeyboardButton(
                     text="\U0001f3e0 Уборка по комнатам",
                     callback_data=f"vrooms:{eid}",
                 )])
-            # Routines button
-            routines = self._reg.vacuum_routines.get(eid, [])
-            if routines:
+            if caps.supports_routines:
                 extra_rows.append([InlineKeyboardButton(
-                    text=f"\U0001f3ac Сценарии ({len(routines)})",
+                    text=f"\U0001f3ac Сценарии ({caps.routine_count})",
                     callback_data=f"vrtn:{eid}",
                 )])
             if extra_rows:
-                # Insert before the last two rows (fav/notif + back)
                 rows = k.inline_keyboard[:]
                 insert_pos = max(0, len(rows) - 2)
                 for er in reversed(extra_rows):
@@ -621,6 +951,293 @@ class Handlers:
         await self._show_notif_list(cid, uid, page)
 
     # -----------------------------------------------------------------------
+    # nact: — notification action (from actionable notification buttons)
+    # -----------------------------------------------------------------------
+
+    async def _notif_action(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        # nact:entity_id:service
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        eid, service = parts[1], parts[2]
+        domain = eid.split(".", 1)[0]
+        if service not in _ALLOWED_SERVICES:
+            await cb.answer("Недопустимый сервис.", show_alert=True)
+            return
+
+        await cb.answer("\u2699\ufe0f Выполняю...")
+        ok, err = await self._ha.call_service(domain, service, {"entity_id": eid})
+        if ok:
+            self._rl.record()
+            await cb.answer(f"\u2705 {service}", show_alert=False)
+        else:
+            await cb.answer(f"\u274c {(err or '')[:180]}", show_alert=True)
+
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action=f"nact.{domain}.{service}", entity_id=eid,
+                     success=ok, error=err if not ok else None)
+
+    # -----------------------------------------------------------------------
+    # nmute: — mute notifications from notification message
+    # -----------------------------------------------------------------------
+
+    async def _notif_mute(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        # nmute:entity_id:target_user_id
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        eid = parts[1]
+        try:
+            target_uid = int(parts[2])
+        except ValueError:
+            await cb.answer()
+            return
+
+        # Only the target user can mute their own notifications
+        if uid != target_uid:
+            await cb.answer("\u26d4 Можно отключить только свои уведомления.", show_alert=True)
+            return
+
+        mute_until = time.time() + 3600  # 1 hour
+        await self._db.set_mute(uid, eid, mute_until)
+        await cb.answer("\U0001f515 Уведомления отключены на 1 час.", show_alert=False)
+
+    # -----------------------------------------------------------------------
+    # fap: — favorite actions pagination
+    # -----------------------------------------------------------------------
+
+    async def _fav_actions_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            page = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            page = 0
+        await cb.answer()
+        await self._show_fav_actions(cid, uid, page)
+
+    # -----------------------------------------------------------------------
+    # fa_run: — run favorite action
+    # -----------------------------------------------------------------------
+
+    async def _fav_action_run(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            action_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer("Некорректное действие.", show_alert=True)
+            return
+
+        actions = await self._db.get_favorite_actions(uid)
+        action = next((a for a in actions if a["id"] == action_id), None)
+        if not action:
+            await cb.answer("Действие не найдено.", show_alert=True)
+            return
+
+        if not await self._check_rl(uid, "fav_action", cb):
+            return
+
+        await cb.answer("\u2699\ufe0f Выполняю...")
+        payload = action["payload"]
+        domain = payload.get("domain", "")
+        service = payload.get("service", "")
+        svc_data = payload.get("data", {})
+        if not domain or not service:
+            await cb.answer("\u274c Некорректные данные действия.", show_alert=True)
+            return
+
+        ok, err = await self._ha.call_service(domain, service, svc_data)
+        if ok:
+            self._rl.record()
+            await cb.answer(f"\u2705 {action.get('label', 'OK')}", show_alert=False)
+        else:
+            await cb.answer(f"\u274c {(err or '')[:180]}", show_alert=True)
+
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action=f"fav_action.{domain}.{service}",
+                     entity_id=svc_data.get("entity_id"),
+                     success=ok, error=err if not ok else None)
+
+    # -----------------------------------------------------------------------
+    # fa_del: — delete favorite action
+    # -----------------------------------------------------------------------
+
+    async def _fav_action_del(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            action_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+
+        deleted = await self._db.remove_favorite_action(uid, action_id)
+        if deleted:
+            await cb.answer("\U0001f5d1 Удалено.")
+        else:
+            await cb.answer("Не найдено.", show_alert=True)
+        await self._show_fav_actions(cid, uid, 0)
+
+    # -----------------------------------------------------------------------
+    # srp: — search results pagination
+    # -----------------------------------------------------------------------
+
+    async def _search_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            page = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            page = 0
+        await cb.answer()
+
+        cached = self._search_cache.get(cid, [])
+        if not cached:
+            t, k = build_search_prompt()
+            await self._send_or_edit(cid, t, k, menu="search")
+            return
+
+        t, k = build_search_results("...", cached, page, self._cfg.menu_page_size)
+        await self._send_or_edit(cid, t, k, menu="search_results")
+
+    # -----------------------------------------------------------------------
+    # diag: — diagnostics callbacks
+    # -----------------------------------------------------------------------
+
+    async def _diag_cb(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        target = data.split(":", 1)[1] if ":" in data else ""
+        await cb.answer()
+
+        if not await self._check_role(uid, "admin"):
+            t, k = build_confirmation("\u26d4 Требуются права администратора.", "nav:main")
+            await self._send_or_edit(cid, t, k, menu="diag_err")
+            return
+
+        if target == "refresh":
+            diag_text = await self._diag.get_diagnostics_text()
+            t, k = build_diagnostics_menu(diag_text)
+            await self._send_or_edit(cid, t, k, menu="diag")
+        elif target == "trace":
+            trace = await self._diag.trace_last_error()
+            t, k = build_confirmation(trace, "nav:main")
+            await self._send_or_edit(cid, t, k, menu="diag_trace")
+
+    # -----------------------------------------------------------------------
+    # snap: — snapshot detail
+    # -----------------------------------------------------------------------
+
+    async def _snap_detail(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            snap_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        await cb.answer()
+
+        snap = await self._db.get_snapshot(snap_id)
+        if not snap:
+            t, k = build_confirmation("\u274c Снимок не найден.", "menu:snapshots")
+            await self._send_or_edit(cid, t, k, menu="snap_err")
+            return
+
+        t, k = build_snapshot_detail(snap)
+        await self._send_or_edit(cid, t, k, menu="snap_detail")
+
+    # -----------------------------------------------------------------------
+    # snapdiff: — snapshot diff
+    # -----------------------------------------------------------------------
+
+    async def _snap_diff(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            snap_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        await cb.answer("\U0001f504 Сравниваю...")
+
+        snap = await self._db.get_snapshot(snap_id)
+        if not snap:
+            t, k = build_confirmation("\u274c Снимок не найден.", "menu:snapshots")
+            await self._send_or_edit(cid, t, k, menu="snap_err")
+            return
+
+        diff_lines: list[str] = []
+        snap_entities = {e["entity_id"]: e for e in snap.get("payload", [])}
+
+        for eid, snap_ent in list(snap_entities.items())[:50]:
+            current = await self._ha.get_state(eid)
+            if current is None:
+                diff_lines.append(f"\u2796 {eid}: removed")
+                continue
+            old_state = snap_ent.get("state", "?")
+            new_state = current.get("state", "?")
+            if old_state != new_state:
+                diff_lines.append(f"\u2022 {eid}: {old_state} \u2192 {new_state}")
+
+        diff_text = "\n".join(diff_lines[:30]) if diff_lines else "No changes detected."
+        t, k = build_snapshot_detail(snap, diff_text)
+        await self._send_or_edit(cid, t, k, menu="snap_diff")
+
+    # -----------------------------------------------------------------------
+    # snapdel: — delete snapshot
+    # -----------------------------------------------------------------------
+
+    async def _snap_del(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            snap_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+
+        deleted = await self._db.delete_snapshot(snap_id, uid)
+        if deleted:
+            await cb.answer("\U0001f5d1 Снимок удалён.")
+        else:
+            await cb.answer("Не найдено.", show_alert=True)
+
+        snaps = await self._db.get_snapshots(uid)
+        t, k = build_snapshots_list(snaps)
+        await self._send_or_edit(cid, t, k, menu="snapshots")
+
+    # -----------------------------------------------------------------------
+    # schtog: — toggle schedule
+    # -----------------------------------------------------------------------
+
+    async def _sched_toggle(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            sched_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+
+        result = await self._db.toggle_schedule(sched_id, uid)
+        if result is None:
+            await cb.answer("Не найдено.", show_alert=True)
+            return
+        label = "включено" if result else "отключено"
+        await cb.answer(f"\u23f0 Расписание {label}.")
+
+        scheds = await self._db.get_schedules(uid)
+        t, k = build_schedule_list(scheds)
+        await self._send_or_edit(cid, t, k, menu="schedule")
+
+    # -----------------------------------------------------------------------
+    # schdel: — delete schedule
+    # -----------------------------------------------------------------------
+
+    async def _sched_del(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            sched_id = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+
+        deleted = await self._db.delete_schedule(sched_id, uid)
+        if deleted:
+            await cb.answer("\U0001f5d1 Удалено.")
+        else:
+            await cb.answer("Не найдено.", show_alert=True)
+
+        scheds = await self._db.get_schedules(uid)
+        t, k = build_schedule_list(scheds)
+        await self._send_or_edit(cid, t, k, menu="schedule")
+
+    # -----------------------------------------------------------------------
     # vrooms: — vacuum room selection menu
     # -----------------------------------------------------------------------
 
@@ -631,12 +1248,7 @@ class Handlers:
         state = await self._ha.get_state(eid)
         name = state.get("attributes", {}).get("friendly_name", eid) if state else eid
 
-        # Try DB segments first, then config presets
-        segments = await self._db.get_vacuum_room_map(eid)
-        if not segments:
-            presets = list(self._cfg.vacuum_room_presets)
-            segments = [{"segment_id": r, "segment_name": r.replace("_", " ").title()} for r in presets]
-
+        segments = await self._vac.get_rooms(eid)
         if not segments:
             t, k = build_confirmation(
                 "\U0001f916 Уборка по комнатам недоступна.\nНет сегментов/комнат.",
@@ -663,11 +1275,7 @@ class Handlers:
         state = await self._ha.get_state(eid)
         name = state.get("attributes", {}).get("friendly_name", eid) if state else eid
 
-        segments = await self._db.get_vacuum_room_map(eid)
-        if not segments:
-            presets = list(self._cfg.vacuum_room_presets)
-            segments = [{"segment_id": r, "segment_name": r.replace("_", " ").title()} for r in presets]
-
+        segments = await self._vac.get_rooms(eid)
         t, k = build_vacuum_rooms(eid, name, segments, selected_room=seg_id)
         await self._send_or_edit(cid, t, k, menu="vac_room_sel", entity=eid, room=seg_id)
 
@@ -686,52 +1294,12 @@ class Handlers:
 
         await cb.answer("\u2699\ufe0f Запускаю уборку...")
 
-        # Try real segment clean (int segment ids) or fallback to presets
-        ok = False
-        err = ""
-        strategy = self._cfg.vacuum_room_strategy
-
-        # Check if seg_id is numeric (real segment from integration)
-        try:
-            seg_int = int(seg_id)
-            is_real = True
-        except ValueError:
-            is_real = False
-            seg_int = 0
-
-        if is_real:
-            # Real segment clean via roborock / vacuum.send_command
-            ok, err = await self._ha.call_service(
-                "vacuum", "send_command",
-                {"entity_id": eid, "command": "app_segment_clean", "params": [seg_int]},
-            )
-        elif strategy == "script" and self._cfg.vacuum_room_script_entity_id:
-            ok, err = await self._ha.call_service(
-                "script", "turn_on",
-                {
-                    "entity_id": self._cfg.vacuum_room_script_entity_id,
-                    "variables": {"vacuum_entity": eid, "room": seg_id},
-                },
-            )
-        elif strategy == "service_data":
-            ok, err = await self._ha.call_service(
-                "vacuum", "send_command",
-                {"entity_id": eid, "command": "app_segment_clean", "params": {"rooms": [seg_id]}},
-            )
-        else:
-            ok, err = await self._ha.call_service("vacuum", "start", {"entity_id": eid})
-
+        ok, err = await self._vac.clean_segment(eid, seg_id)
         if ok:
             self._rl.record()
 
-        seg_display = seg_id
-        segments = await self._db.get_vacuum_room_map(eid)
-        for s in segments:
-            if s["segment_id"] == seg_id:
-                seg_display = s.get("segment_name") or seg_id
-                break
-        if not segments:
-            seg_display = seg_id.replace("_", " ").title()
+        segments = await self._vac.get_rooms(eid)
+        seg_display = self._vac.get_segment_display_name(seg_id, segments)
 
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="vacuum.segment_clean", entity_id=eid,
@@ -756,22 +1324,22 @@ class Handlers:
         if len(parts) < 3:
             await cb.answer()
             return
-        eid, service = parts[1], parts[2]
-        if service not in ("stop", "return_to_base"):
+        eid, command = parts[1], parts[2]
+        if command not in ("stop", "return_to_base"):
             await cb.answer("Недопустимая команда.", show_alert=True)
             return
-        if not await self._check_rl(uid, f"vacuum.{service}", cb):
+        if not await self._check_rl(uid, f"vacuum.{command}", cb):
             return
 
         await cb.answer("\u2699\ufe0f Выполняю...")
-        ok, err = await self._ha.call_service("vacuum", service, {"entity_id": eid})
+        ok, err = await self._vac.execute_command(eid, command)
         if ok:
             self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
-                     action=f"vacuum.{service}", entity_id=eid,
+                     action=f"vacuum.{command}", entity_id=eid,
                      success=ok, error=err if not ok else None)
 
-        label = service.replace("_", " ").title()
+        label = command.replace("_", " ").title()
         if ok:
             t, k = build_confirmation(f"\u2705 Vacuum: {label}", f"ent:{eid}")
         else:
@@ -789,15 +1357,7 @@ class Handlers:
         state = await self._ha.get_state(eid)
         name = state.get("attributes", {}).get("friendly_name", eid) if state else eid
 
-        routine_eids = self._reg.vacuum_routines.get(eid, [])
-        routines: list[dict[str, Any]] = []
-        for r_eid in routine_eids:
-            r_state = await self._ha.get_state(r_eid)
-            r_name = r_eid
-            if r_state:
-                r_name = r_state.get("attributes", {}).get("friendly_name", r_eid)
-            routines.append({"entity_id": r_eid, "name": r_name})
-
+        routines = await self._vac.get_routines(eid)
         t, k = build_vacuum_routines(eid, name, routines)
         await self._send_or_edit(cid, t, k, menu="vac_routines", entity=eid)
 
@@ -814,7 +1374,7 @@ class Handlers:
             return
 
         await cb.answer("\u2699\ufe0f Запускаю сценарий...")
-        ok, err = await self._ha.call_service("button", "press", {"entity_id": btn_eid})
+        ok, err = await self._vac.press_routine(btn_eid)
         if ok:
             self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
@@ -823,12 +1383,10 @@ class Handlers:
 
         # Find parent vacuum for back button
         parent_vac = ""
-        reg_ent = self._reg.entities.get(btn_eid)
-        if reg_ent and reg_ent.device_id:
-            for vac_eid, btns in self._reg.vacuum_routines.items():
-                if btn_eid in btns:
-                    parent_vac = vac_eid
-                    break
+        for vac_eid, btns in self._reg.vacuum_routines.items():
+            if btn_eid in btns:
+                parent_vac = vac_eid
+                break
 
         back = f"vrtn:{parent_vac}" if parent_vac else "nav:main"
         if ok:
@@ -894,12 +1452,17 @@ class Handlers:
     async def _show_favorites(self, cid: int, uid: int, page: int) -> None:
         fav_eids = await self._db.get_favorites(uid)
         ent_list = await self._enrich_entities(fav_eids)
-        t, k = build_favorites_menu(ent_list, page, self._cfg.menu_page_size)
+        fav_actions = await self._db.get_favorite_actions(uid)
+        t, k = build_favorites_menu(ent_list, page, self._cfg.menu_page_size, fav_actions)
         await self._send_or_edit(cid, t, k, menu="favorites")
+
+    async def _show_fav_actions(self, cid: int, uid: int, page: int) -> None:
+        actions = await self._db.get_favorite_actions(uid)
+        t, k = build_fav_actions_menu(actions, page)
+        await self._send_or_edit(cid, t, k, menu="fav_actions")
 
     async def _show_notif_list(self, cid: int, uid: int, page: int) -> None:
         subs = await self._db.get_user_notifications(uid)
-        # Enrich with friendly names
         enriched = []
         for sub in subs:
             state = await self._ha.get_state(sub["entity_id"])
@@ -926,6 +1489,37 @@ class Handlers:
             msg = "\u274c Ошибка синхронизации. Проверьте логи."
         t, k = build_confirmation(msg, "nav:main")
         await self._send_or_edit(cid, t, k, menu="refreshed")
+
+    # -----------------------------------------------------------------------
+    # Search
+    # -----------------------------------------------------------------------
+
+    async def _do_search(
+        self, cid: int, uid: int, query: str,
+        message: Message | None = None,
+    ) -> None:
+        query_lower = query.lower()
+        all_states = await self._ha.list_states()
+        results: list[dict[str, Any]] = []
+
+        for s in all_states:
+            eid = s.get("entity_id", "")
+            fname = s.get("attributes", {}).get("friendly_name", eid)
+            if query_lower in eid.lower() or query_lower in fname.lower():
+                results.append({
+                    "entity_id": eid,
+                    "friendly_name": fname,
+                    "state": s.get("state", "unknown"),
+                    "domain": eid.split(".", 1)[0],
+                })
+
+        self._search_cache[cid] = results
+
+        t, k = build_search_results(query, results, 0, self._cfg.menu_page_size)
+        tid = self._get_thread_id(message) if message else None
+        await self._send_or_edit(
+            cid, t, k, source=message, menu="search_results", thread_id=tid,
+        )
 
     # -----------------------------------------------------------------------
     # Data helpers
@@ -982,6 +1576,18 @@ class Handlers:
         "ntog": _notif_toggle,
         "favp": _fav_page,
         "nfp": _notif_page,
+        "nact": _notif_action,
+        "nmute": _notif_mute,
+        "fap": _fav_actions_page,
+        "fa_run": _fav_action_run,
+        "fa_del": _fav_action_del,
+        "srp": _search_page,
+        "diag": _diag_cb,
+        "snap": _snap_detail,
+        "snapdiff": _snap_diff,
+        "snapdel": _snap_del,
+        "schtog": _sched_toggle,
+        "schdel": _sched_del,
         "vrooms": _vac_rooms,
         "vroom": _vac_room_sel,
         "vseg": _vac_seg_clean,
