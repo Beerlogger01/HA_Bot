@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""
-Home Assistant Telegram Bot Add-on.
+"""Home Assistant Telegram Bot Add-on.
 
 Secure Telegram bot for controlling Home Assistant via Supervisor proxy API.
 
 Features:
-- Multi-level interactive menu with inline buttons
-- Dynamic device/action discovery from Home Assistant
-- Vacuum room targeting (script or service_data mode)
+- Floors / Areas / Entities navigation via HA registries
+- Vacuum room targeting (segments) + Roborock routines
+- Per-user favorites and notification subscriptions
 - Edit-in-place message cleanup
 - Security: chat/user whitelisting, deny-by-default
 - Rate limiting: per-user cooldown + global sliding window
@@ -32,6 +31,8 @@ from aiogram.filters import Command
 
 from api import HAClient
 from handlers import GlobalRateLimiter, Handlers
+from notifications import NotificationManager
+from registry import HARegistry
 from storage import Database
 
 # ---------------------------------------------------------------------------
@@ -48,8 +49,6 @@ DB_PATH = DATA_DIR / "bot.sqlite3"
 
 
 class _JsonFormatter(logging.Formatter):
-    """Emit each log record as a single-line JSON object."""
-
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "ts": self.formatTime(record, self.datefmt),
@@ -85,12 +84,6 @@ logger = _setup_logging()
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Validated, immutable add-on configuration.
-
-    supervisor_token is intentionally kept out of this dataclass so it can
-    never be serialised or logged by accident.
-    """
-
     bot_token: str
     allowed_chat_id: int
     allowed_user_ids: frozenset[int]
@@ -98,27 +91,46 @@ class Config:
     global_rate_limit_actions: int
     global_rate_limit_window: int
     status_entities: tuple[str, ...]
-    # Dynamic menu options
     menu_domains_allowlist: tuple[str, ...]
     menu_page_size: int
     show_all_enabled: bool
-    # Vacuum room targeting
-    vacuum_room_strategy: str  # "script" or "service_data"
+    vacuum_room_strategy: str
     vacuum_room_script_entity_id: str
     vacuum_room_presets: tuple[str, ...]
-    # Legacy single-entity options (still supported for backwards compat)
     light_entity_id: str
     vacuum_entity_id: str
     goodnight_scene_id: str
 
 
+def _coerce_user_ids(raw: Any) -> list[int]:
+    """Flexibly coerce allowed_user_ids from various input formats."""
+    if isinstance(raw, list):
+        result = []
+        for item in raw:
+            if isinstance(item, int):
+                result.append(item)
+            elif isinstance(item, str):
+                try:
+                    result.append(int(item.strip()))
+                except ValueError:
+                    logger.warning("Ignoring non-integer user_id: %r", item)
+            elif isinstance(item, float):
+                result.append(int(item))
+        return result
+    if isinstance(raw, int):
+        logger.warning("allowed_user_ids is a single int — wrapping in list")
+        return [raw]
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw:
+            try:
+                return [int(raw)]
+            except ValueError:
+                logger.warning("Cannot parse allowed_user_ids string: %r", raw)
+    return []
+
+
 def _load_and_validate_config() -> tuple[Config, str]:
-    """Load /data/options.json and SUPERVISOR_TOKEN.
-
-    Returns (config, supervisor_token).
-    Exits on validation failure.
-    """
-
     if not OPTIONS_PATH.exists():
         logger.critical("Configuration file not found: %s", OPTIONS_PATH)
         sys.exit(1)
@@ -135,108 +147,77 @@ def _load_and_validate_config() -> tuple[Config, str]:
         logger.critical("bot_token is missing or empty")
         sys.exit(1)
 
+    # -- chat id --
     allowed_chat_id = raw.get("allowed_chat_id", 0)
     if not isinstance(allowed_chat_id, int):
-        logger.critical("allowed_chat_id must be an integer")
-        sys.exit(1)
+        try:
+            allowed_chat_id = int(allowed_chat_id)
+        except (TypeError, ValueError):
+            allowed_chat_id = 0
     if allowed_chat_id == 0:
         logger.warning("allowed_chat_id is 0 — open mode, any chat accepted")
 
-    user_ids_raw = raw.get("allowed_user_ids", [])
-    if not isinstance(user_ids_raw, list) or not all(
-        isinstance(i, int) for i in user_ids_raw
-    ):
-        logger.critical("allowed_user_ids must be a list of integers")
-        sys.exit(1)
-    if not user_ids_raw:
+    # -- user ids (flexible) --
+    user_ids = _coerce_user_ids(raw.get("allowed_user_ids", []))
+    if not user_ids:
         logger.warning("allowed_user_ids is empty — open mode, any user accepted")
 
     # -- rate limiting --
     cooldown = raw.get("cooldown_seconds", 2)
     if not isinstance(cooldown, int) or cooldown < 0:
-        logger.critical("cooldown_seconds must be a non-negative integer")
-        sys.exit(1)
+        cooldown = 2
 
     rate_actions = raw.get("global_rate_limit_actions", 10)
-    rate_window = raw.get("global_rate_limit_window", 5)
     if not isinstance(rate_actions, int) or rate_actions < 1:
-        logger.critical("global_rate_limit_actions must be >= 1")
-        sys.exit(1)
+        rate_actions = 10
+    rate_window = raw.get("global_rate_limit_window", 5)
     if not isinstance(rate_window, int) or rate_window < 1:
-        logger.critical("global_rate_limit_window must be >= 1")
-        sys.exit(1)
+        rate_window = 5
 
     # -- status entities --
     status_raw = raw.get("status_entities", [])
     if not isinstance(status_raw, list):
         status_raw = []
-    for eid in status_raw:
-        if not isinstance(eid, str) or "." not in eid:
-            logger.critical("Invalid entity_id in status_entities: '%s'", eid)
-            sys.exit(1)
+    status_ents = tuple(
+        eid for eid in status_raw if isinstance(eid, str) and "." in eid
+    )
 
-    # -- legacy single-entity options --
-    light = raw.get("light_entity_id", "") or ""
-    vacuum = raw.get("vacuum_entity_id", "") or ""
-    scene = raw.get("goodnight_scene_id", "") or ""
-
-    for label, eid in [
-        ("light_entity_id", light),
-        ("vacuum_entity_id", vacuum),
-        ("goodnight_scene_id", scene),
-    ]:
-        if eid and "." not in eid:
-            logger.critical(
-                "%s='%s' is not a valid entity_id (expected 'domain.name')", label, eid
-            )
-            sys.exit(1)
+    # -- legacy single-entity options (optional, never fatal) --
+    light = str(raw.get("light_entity_id", "") or "")
+    vacuum = str(raw.get("vacuum_entity_id", "") or "")
+    scene = str(raw.get("goodnight_scene_id", "") or "")
 
     # -- dynamic menu options --
     default_domains = ["light", "switch", "vacuum", "scene", "script", "climate", "fan", "cover"]
-    domains_allowlist = raw.get("menu_domains_allowlist", default_domains)
-    if not isinstance(domains_allowlist, list):
-        domains_allowlist = default_domains
-    # Validate domain names are simple strings
-    domains_allowlist = [d for d in domains_allowlist if isinstance(d, str) and d.strip()]
-    if not domains_allowlist:
-        domains_allowlist = default_domains
+    domains_al = raw.get("menu_domains_allowlist", default_domains)
+    if not isinstance(domains_al, list):
+        domains_al = default_domains
+    domains_al = [d for d in domains_al if isinstance(d, str) and d.strip()]
+    if not domains_al:
+        domains_al = default_domains
 
-    menu_page_size = raw.get("menu_page_size", 8)
-    if not isinstance(menu_page_size, int) or menu_page_size < 1:
-        logger.warning("menu_page_size invalid, defaulting to 8")
-        menu_page_size = 8
-    menu_page_size = min(menu_page_size, 20)  # Cap at 20
+    page_size = raw.get("menu_page_size", 8)
+    if not isinstance(page_size, int) or page_size < 1:
+        page_size = 8
+    page_size = min(page_size, 20)
 
-    show_all_enabled = raw.get("show_all_enabled", False)
-    if not isinstance(show_all_enabled, bool):
-        show_all_enabled = False
+    show_all = raw.get("show_all_enabled", False)
+    if not isinstance(show_all, bool):
+        show_all = False
 
     # -- vacuum room targeting --
-    vacuum_room_strategy = raw.get("vacuum_room_strategy", "service_data")
-    if vacuum_room_strategy not in ("script", "service_data"):
-        logger.warning(
-            "vacuum_room_strategy='%s' invalid, defaulting to 'service_data'",
-            vacuum_room_strategy,
-        )
-        vacuum_room_strategy = "service_data"
+    vac_strategy = raw.get("vacuum_room_strategy", "service_data")
+    if vac_strategy not in ("script", "service_data"):
+        vac_strategy = "service_data"
 
-    vacuum_room_script = raw.get("vacuum_room_script_entity_id", "") or ""
-    if vacuum_room_script and "." not in vacuum_room_script:
-        logger.critical(
-            "vacuum_room_script_entity_id='%s' is not a valid entity_id",
-            vacuum_room_script,
-        )
-        sys.exit(1)
-
-    vacuum_rooms_raw = raw.get(
+    vac_script = str(raw.get("vacuum_room_script_entity_id", "") or "")
+    vac_rooms_raw = raw.get(
         "vacuum_room_presets",
         ["bathroom", "kitchen", "living_room", "bedroom"],
     )
-    if not isinstance(vacuum_rooms_raw, list):
-        vacuum_rooms_raw = ["bathroom", "kitchen", "living_room", "bedroom"]
-    vacuum_rooms = tuple(
-        r for r in vacuum_rooms_raw if isinstance(r, str) and r.strip()
-    )
+    if not isinstance(vac_rooms_raw, list):
+        vac_rooms_raw = ["bathroom", "kitchen", "living_room", "bedroom"]
+    vac_rooms = tuple(r for r in vac_rooms_raw if isinstance(r, str) and r.strip())
 
     # --- SUPERVISOR_TOKEN ---
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
@@ -247,17 +228,17 @@ def _load_and_validate_config() -> tuple[Config, str]:
     config = Config(
         bot_token=bot_token.strip(),
         allowed_chat_id=allowed_chat_id,
-        allowed_user_ids=frozenset(user_ids_raw),
+        allowed_user_ids=frozenset(user_ids),
         cooldown_seconds=cooldown,
         global_rate_limit_actions=rate_actions,
         global_rate_limit_window=rate_window,
-        status_entities=tuple(status_raw),
-        menu_domains_allowlist=tuple(domains_allowlist),
-        menu_page_size=menu_page_size,
-        show_all_enabled=show_all_enabled,
-        vacuum_room_strategy=vacuum_room_strategy,
-        vacuum_room_script_entity_id=vacuum_room_script,
-        vacuum_room_presets=vacuum_rooms,
+        status_entities=status_ents,
+        menu_domains_allowlist=tuple(domains_al),
+        menu_page_size=page_size,
+        show_all_enabled=show_all,
+        vacuum_room_strategy=vac_strategy,
+        vacuum_room_script_entity_id=vac_script,
+        vacuum_room_presets=vac_rooms,
         light_entity_id=light,
         vacuum_entity_id=vacuum,
         goodnight_scene_id=scene,
@@ -271,14 +252,14 @@ def _load_and_validate_config() -> tuple[Config, str]:
 
 
 class TelegramBot:
-    """Core bot controller — wires handlers, manages lifecycle."""
-
     def __init__(self, config: Config, supervisor_token: str) -> None:
         self._config = config
         self._bot = Bot(token=config.bot_token)
         self._dp = Dispatcher()
         self._ha = HAClient(supervisor_token)
         self._db = Database(DB_PATH)
+        self._registry = HARegistry(supervisor_token, self._db)
+        self._notif = NotificationManager(supervisor_token, self._db, self._bot)
         self._global_rl = GlobalRateLimiter(
             config.global_rate_limit_actions,
             config.global_rate_limit_window,
@@ -289,18 +270,16 @@ class TelegramBot:
             db=self._db,
             config=config,
             global_rl=self._global_rl,
+            registry=self._registry,
         )
 
-        # Register command handlers
         self._dp.message.register(self._handlers.cmd_start, Command("start"))
         self._dp.message.register(self._handlers.cmd_start, Command("menu"))
         self._dp.message.register(self._handlers.cmd_status, Command("status"))
         self._dp.message.register(self._handlers.cmd_ping, Command("ping"))
-        # Register callback query handler
         self._dp.callback_query.register(self._handlers.handle_callback)
 
     async def run(self) -> None:
-        """Open resources, perform self-test, then block on long-polling."""
         await self._db.open()
         await self._ha.open()
 
@@ -311,50 +290,56 @@ class TelegramBot:
             ha_version = ha_cfg.get("version", "unknown")
             logger.info("HA API self-test passed — version %s", ha_version)
         else:
-            logger.error(
-                "HA API self-test FAILED — check network / SUPERVISOR_TOKEN"
-            )
+            logger.error("HA API self-test FAILED — check SUPERVISOR_TOKEN / network")
 
-        # Store HA version for /ping
-        self._ha_version = ha_version
         self._handlers.ha_version = ha_version
 
-        # Log bot identity via getMe
+        # Registry sync
+        logger.info("Starting registry sync...")
+        sync_ok = await self._registry.sync()
+        if sync_ok:
+            logger.info(
+                "Registry sync complete: %d floors, %d areas, %d devices, %d entities",
+                len(self._registry.floors),
+                len(self._registry.areas),
+                len(self._registry.devices),
+                len(self._registry.entities),
+            )
+            for vac_eid, btns in self._registry.vacuum_routines.items():
+                logger.info("Vacuum %s: %d routines", vac_eid, len(btns))
+        else:
+            logger.warning("Registry sync failed — bot will work with limited navigation")
+
+        # Start notification listener
+        await self._notif.start()
+
+        # Bot identity
         try:
             me = await self._bot.get_me()
             logger.info("Bot initialized — @%s (id=%s)", me.username, me.id)
         except Exception:
             logger.warning("Could not fetch bot info via getMe")
 
-        # Log current authorization mode
+        # Auth mode log
         chat_mode = (
             f"chat_id={self._config.allowed_chat_id}"
             if self._config.allowed_chat_id != 0
             else "any chat"
         )
         user_count = len(self._config.allowed_user_ids)
-        user_mode = (
-            f"{user_count} allowed user(s)"
-            if user_count > 0
-            else "any user"
-        )
+        user_mode = f"{user_count} allowed user(s)" if user_count > 0 else "any user"
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
-
-        logger.info(
-            "Hint: If the bot does not respond in groups, "
-            "check BotFather Group Privacy settings."
-        )
-
         logger.info("Bot polling started")
+
         await self._dp.start_polling(
             self._bot,
             allowed_updates=["message", "callback_query"],
         )
 
     async def shutdown(self) -> None:
-        """Release all resources. Safe to call even if run() failed."""
         errors: list[str] = []
         for label, coro in [
+            ("notifications", self._notif.stop()),
             ("HA session", self._ha.close()),
             ("database", self._db.close()),
             ("bot session", self._bot.session.close()),
