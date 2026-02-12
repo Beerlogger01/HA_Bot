@@ -10,7 +10,7 @@ fi
 
 # Check if allowed_chat_id is configured
 if bashio::config.equals 'allowed_chat_id' '0'; then
-    bashio::log.warning "allowed_chat_id is 0. Bot will not accept commands until configured."
+    bashio::log.warning "allowed_chat_id is 0 — open mode, any chat accepted."
 fi
 
 # Check if SUPERVISOR_TOKEN exists

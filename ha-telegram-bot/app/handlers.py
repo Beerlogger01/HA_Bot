@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Bot
@@ -150,6 +151,7 @@ class Handlers:
         self._db = db
         self._cfg = config
         self._rl = global_rl
+        self.ha_version: str = "unknown"
 
     # -----------------------------------------------------------------------
     # Security helpers
@@ -319,6 +321,11 @@ class Handlers:
         await self._send_or_edit_menu(
             chat_id, text, keyboard, source_message=message, current_menu="status"
         )
+
+    async def cmd_ping(self, message: Message) -> None:
+        """Handle /ping — lightweight liveness check."""
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        await message.answer(f"pong  |  HA {self.ha_version}  |  {ts}")
 
     # -----------------------------------------------------------------------
     # Callback query handler (main dispatcher)

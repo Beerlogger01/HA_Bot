@@ -140,9 +140,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
         logger.critical("allowed_chat_id must be an integer")
         sys.exit(1)
     if allowed_chat_id == 0:
-        logger.warning(
-            "allowed_chat_id is 0 — bot will reject every message until configured"
-        )
+        logger.warning("allowed_chat_id is 0 — open mode, any chat accepted")
 
     user_ids_raw = raw.get("allowed_user_ids", [])
     if not isinstance(user_ids_raw, list) or not all(
@@ -151,7 +149,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
         logger.critical("allowed_user_ids must be a list of integers")
         sys.exit(1)
     if not user_ids_raw:
-        logger.warning("allowed_user_ids is empty — all actions will be denied")
+        logger.warning("allowed_user_ids is empty — open mode, any user accepted")
 
     # -- rate limiting --
     cooldown = raw.get("cooldown_seconds", 2)
@@ -297,6 +295,7 @@ class TelegramBot:
         self._dp.message.register(self._handlers.cmd_start, Command("start"))
         self._dp.message.register(self._handlers.cmd_start, Command("menu"))
         self._dp.message.register(self._handlers.cmd_status, Command("status"))
+        self._dp.message.register(self._handlers.cmd_ping, Command("ping"))
         # Register callback query handler
         self._dp.callback_query.register(self._handlers.handle_callback)
 
@@ -307,15 +306,44 @@ class TelegramBot:
 
         # Self-test
         ha_cfg = await self._ha.get_config()
+        ha_version = "unknown"
         if ha_cfg:
-            logger.info(
-                "HA API self-test passed — version %s",
-                ha_cfg.get("version", "unknown"),
-            )
+            ha_version = ha_cfg.get("version", "unknown")
+            logger.info("HA API self-test passed — version %s", ha_version)
         else:
             logger.error(
                 "HA API self-test FAILED — check network / SUPERVISOR_TOKEN"
             )
+
+        # Store HA version for /ping
+        self._ha_version = ha_version
+        self._handlers.ha_version = ha_version
+
+        # Log bot identity via getMe
+        try:
+            me = await self._bot.get_me()
+            logger.info("Bot initialized — @%s (id=%s)", me.username, me.id)
+        except Exception:
+            logger.warning("Could not fetch bot info via getMe")
+
+        # Log current authorization mode
+        chat_mode = (
+            f"chat_id={self._config.allowed_chat_id}"
+            if self._config.allowed_chat_id != 0
+            else "any chat"
+        )
+        user_count = len(self._config.allowed_user_ids)
+        user_mode = (
+            f"{user_count} allowed user(s)"
+            if user_count > 0
+            else "any user"
+        )
+        logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
+
+        logger.info(
+            "Hint: If the bot does not respond in groups, "
+            "check BotFather Group Privacy settings."
+        )
 
         logger.info("Bot polling started")
         await self._dp.start_polling(
