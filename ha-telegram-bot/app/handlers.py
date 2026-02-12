@@ -156,12 +156,10 @@ class Handlers:
     # -----------------------------------------------------------------------
 
     def _is_authorized_chat(self, chat_id: int) -> bool:
-        return chat_id == self._cfg.allowed_chat_id
+        return self._cfg.allowed_chat_id == 0 or chat_id == self._cfg.allowed_chat_id
 
     def _is_authorized_user(self, user_id: int) -> bool:
-        return bool(self._cfg.allowed_user_ids) and (
-            user_id in self._cfg.allowed_user_ids
-        )
+        return (not self._cfg.allowed_user_ids) or (user_id in self._cfg.allowed_user_ids)
 
     @staticmethod
     def _extract_user(obj: Message | CallbackQuery) -> tuple[int | None, str]:

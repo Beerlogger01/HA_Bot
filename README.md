@@ -119,8 +119,8 @@ goodnight_scene_id: ""
 | Option | Description | Required | Default |
 |--------|-------------|----------|---------|
 | `bot_token` | Telegram bot token from BotFather | Yes | - |
-| `allowed_chat_id` | Chat ID (negative for supergroup, positive for private) | Yes | 0 |
-| `allowed_user_ids` | List of authorized Telegram user IDs | Yes | `[]` |
+| `allowed_chat_id` | Chat ID (negative for supergroup, positive for private). `0` = any chat. | No | 0 |
+| `allowed_user_ids` | List of authorized Telegram user IDs. Empty = any user. | No | `[]` |
 | `cooldown_seconds` | Per-user action cooldown in seconds | No | 2 |
 | `global_rate_limit_actions` | Max actions per time window | No | 10 |
 | `global_rate_limit_window` | Time window in seconds | No | 5 |
@@ -281,13 +281,13 @@ vacuum_room_presets:
 
 ### Chat Whitelisting
 
-Only the configured `allowed_chat_id` can interact with the bot. Other chats receive an unauthorized message.
+If `allowed_chat_id` is set to `0` (the default), the bot accepts commands from **any chat** (open mode). Set it to a specific chat ID to restrict access to that chat only.
 
 ### User Authorization
 
-Only users in `allowed_user_ids` can perform actions.
+If `allowed_user_ids` is empty `[]` (the default), the bot accepts commands from **any user** (open mode). Add specific user IDs to restrict access.
 
-**Important**: If `allowed_user_ids` is empty, **all actions are denied** (safe default). The bot will log denied attempts with user IDs so you can find and add authorized users.
+These are "open mode" defaults so the bot works out-of-the-box. You can tighten security at any time by setting a specific chat ID and adding user IDs.
 
 ### Rate Limiting
 
