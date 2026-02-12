@@ -2,6 +2,13 @@
 
 Runs a persistent background WS connection.  When a subscribed entity
 changes state, sends a Telegram message to the user (respecting throttle).
+
+Features:
+- Two modes: state_only and state_and_key_attrs
+- Actionable inline buttons on notifications (Dock/Locate/Pause/Mute)
+- Per-user per-entity mute with expiry
+- Resilient WS reconnect with exponential backoff
+- Single-subscription guard (only one WS subscribe per connection)
 """
 
 from __future__ import annotations
@@ -16,6 +23,7 @@ from typing import Any
 import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from storage import Database
 
@@ -30,9 +38,63 @@ _KEY_ATTRS: dict[str, frozenset[str]] = {
     "media_player": frozenset({"media_title", "source"}),
 }
 
+# Actionable buttons per domain for notification messages
+_NOTIF_ACTIONS: dict[str, list[tuple[str, str, str]]] = {
+    # (label, callback_prefix, service)
+    "vacuum": [
+        ("\U0001f3e0 Dock", "nact", "return_to_base"),
+        ("\U0001f4cd Locate", "nact", "locate"),
+        ("\u23f8 Pause", "nact", "pause"),
+    ],
+    "light": [
+        ("\U0001f7e2 ON", "nact", "turn_on"),
+        ("\u26aa OFF", "nact", "turn_off"),
+    ],
+    "switch": [
+        ("\U0001f7e2 ON", "nact", "turn_on"),
+        ("\u26aa OFF", "nact", "turn_off"),
+    ],
+    "cover": [
+        ("\u2b06 Open", "nact", "open_cover"),
+        ("\u23f9 Stop", "nact", "stop_cover"),
+        ("\u2b07 Close", "nact", "close_cover"),
+    ],
+}
+
+# Reconnect backoff config
+_RECONNECT_BASE = 5
+_RECONNECT_MAX = 120
+
 
 def _sanitize(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _build_notif_buttons(
+    entity_id: str, domain: str, user_id: int,
+) -> InlineKeyboardMarkup | None:
+    """Build actionable inline keyboard for notification message."""
+    actions = _NOTIF_ACTIONS.get(domain)
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if actions:
+        action_row = []
+        for label, prefix, service in actions:
+            cb = f"{prefix}:{entity_id}:{service}"
+            if len(cb) <= 64:
+                action_row.append(InlineKeyboardButton(text=label, callback_data=cb))
+        if action_row:
+            rows.append(action_row)
+
+    # Mute button (1h)
+    mute_cb = f"nmute:{entity_id}:{user_id}"
+    if len(mute_cb) <= 64:
+        rows.append([
+            InlineKeyboardButton(text="\U0001f515 Mute 1h", callback_data=mute_cb),
+            InlineKeyboardButton(text="\u2192 Open", callback_data=f"ent:{entity_id}"),
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 class NotificationManager:
@@ -44,10 +106,12 @@ class NotificationManager:
         self._bot = bot
         self._task: asyncio.Task[None] | None = None
         self._stop = False
+        self._subscribed = False
 
     async def start(self) -> None:
         """Start the background listener."""
         self._stop = False
+        self._subscribed = False
         self._task = asyncio.create_task(self._run_loop(), name="notifications")
         logger.info("Notification listener started")
 
@@ -63,19 +127,23 @@ class NotificationManager:
         logger.info("Notification listener stopped")
 
     async def _run_loop(self) -> None:
-        """Reconnecting event loop."""
+        """Reconnecting event loop with exponential backoff."""
+        backoff = _RECONNECT_BASE
         while not self._stop:
             try:
                 await self._listen()
+                backoff = _RECONNECT_BASE  # Reset on clean exit
             except asyncio.CancelledError:
                 return
             except Exception:
-                logger.exception("Notification listener error, reconnecting in 10s")
+                logger.exception("Notification listener error, reconnecting in %ds", backoff)
             if not self._stop:
-                await asyncio.sleep(10)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _RECONNECT_MAX)
 
     async def _listen(self) -> None:
         """Single WebSocket session: auth, subscribe, process events."""
+        self._subscribed = False
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
                 HA_WS_URL, timeout=aiohttp.ClientTimeout(total=0), heartbeat=30
@@ -94,18 +162,20 @@ class NotificationManager:
                     logger.error("Notif WS: auth failed")
                     return
 
-                # Subscribe to state_changed
-                sub_id = 1
-                await ws.send_json({
-                    "id": sub_id,
-                    "type": "subscribe_events",
-                    "event_type": "state_changed",
-                })
-                msg = await asyncio.wait_for(ws.receive(), timeout=10)
-                data = json.loads(msg.data)
-                if not data.get("success"):
-                    logger.error("Notif WS: subscribe failed: %s", data)
-                    return
+                # Subscribe to state_changed (single-subscription guard)
+                if not self._subscribed:
+                    sub_id = 1
+                    await ws.send_json({
+                        "id": sub_id,
+                        "type": "subscribe_events",
+                        "event_type": "state_changed",
+                    })
+                    msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                    data = json.loads(msg.data)
+                    if not data.get("success"):
+                        logger.error("Notif WS: subscribe failed: %s", data)
+                        return
+                    self._subscribed = True
 
                 logger.info("Notification WS subscribed to state_changed")
 
@@ -121,6 +191,8 @@ class NotificationManager:
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         logger.warning("Notif WS connection closed")
                         break
+
+        self._subscribed = False
 
     async def _handle_event(self, data: dict[str, Any]) -> None:
         """Process a single state_changed event."""
@@ -146,6 +218,12 @@ class NotificationManager:
 
         for sub in subs:
             if sub["entity_id"] != entity_id:
+                continue
+
+            user_id = sub["user_id"]
+
+            # Check mute
+            if await self._db.is_muted(user_id, entity_id):
                 continue
 
             # Throttle check
@@ -199,16 +277,24 @@ class NotificationManager:
                 if changes:
                     text += "\n" + "\n".join(changes)
 
-            await self._send_notification(sub["user_id"], text)
-            await self._db.update_notification_sent(sub["user_id"], entity_id)
+            # Build actionable buttons
+            domain = entity_id.split(".", 1)[0]
+            kb = _build_notif_buttons(entity_id, domain, user_id)
 
-    async def _send_notification(self, user_id: int, text: str) -> None:
-        """Send notification message to user. user_id is used as chat_id for private chats."""
+            await self._send_notification(user_id, text, kb)
+            await self._db.update_notification_sent(user_id, entity_id)
+
+    async def _send_notification(
+        self, user_id: int, text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        """Send notification message to user."""
         try:
             await self._bot.send_message(
                 chat_id=user_id,
                 text=text,
                 parse_mode="HTML",
+                reply_markup=reply_markup,
             )
         except TelegramRetryAfter as e:
             logger.warning("Notification rate limited, wait %ss for user %s", e.retry_after, user_id)
