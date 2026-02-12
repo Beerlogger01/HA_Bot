@@ -1,0 +1,219 @@
+"""Notifications — subscribe to HA state_changed events via WebSocket.
+
+Runs a persistent background WS connection.  When a subscribed entity
+changes state, sends a Telegram message to the user (respecting throttle).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Any
+
+import aiohttp
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+
+from storage import Database
+
+logger = logging.getLogger("ha_bot.notifications")
+
+HA_WS_URL = "ws://supervisor/core/websocket"
+
+# Key attributes for mode="state_and_key_attrs" per domain
+_KEY_ATTRS: dict[str, frozenset[str]] = {
+    "vacuum": frozenset({"status", "battery_level", "error", "fan_speed"}),
+    "climate": frozenset({"current_temperature", "temperature", "hvac_action"}),
+    "media_player": frozenset({"media_title", "source"}),
+}
+
+
+def _sanitize(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class NotificationManager:
+    """Background WebSocket listener for state_changed events."""
+
+    def __init__(self, supervisor_token: str, db: Database, bot: Bot) -> None:
+        self._token = supervisor_token
+        self._db = db
+        self._bot = bot
+        self._task: asyncio.Task[None] | None = None
+        self._stop = False
+
+    async def start(self) -> None:
+        """Start the background listener."""
+        self._stop = False
+        self._task = asyncio.create_task(self._run_loop(), name="notifications")
+        logger.info("Notification listener started")
+
+    async def stop(self) -> None:
+        """Stop the background listener."""
+        self._stop = True
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Notification listener stopped")
+
+    async def _run_loop(self) -> None:
+        """Reconnecting event loop."""
+        while not self._stop:
+            try:
+                await self._listen()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Notification listener error, reconnecting in 10s")
+            if not self._stop:
+                await asyncio.sleep(10)
+
+    async def _listen(self) -> None:
+        """Single WebSocket session: auth, subscribe, process events."""
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                HA_WS_URL, timeout=aiohttp.ClientTimeout(total=0), heartbeat=30
+            ) as ws:
+                # Auth
+                msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                data = json.loads(msg.data)
+                if data.get("type") != "auth_required":
+                    logger.error("Notif WS: expected auth_required, got %s", data.get("type"))
+                    return
+
+                await ws.send_json({"type": "auth", "access_token": self._token})
+                msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                data = json.loads(msg.data)
+                if data.get("type") != "auth_ok":
+                    logger.error("Notif WS: auth failed")
+                    return
+
+                # Subscribe to state_changed
+                sub_id = 1
+                await ws.send_json({
+                    "id": sub_id,
+                    "type": "subscribe_events",
+                    "event_type": "state_changed",
+                })
+                msg = await asyncio.wait_for(ws.receive(), timeout=10)
+                data = json.loads(msg.data)
+                if not data.get("success"):
+                    logger.error("Notif WS: subscribe failed: %s", data)
+                    return
+
+                logger.info("Notification WS subscribed to state_changed")
+
+                # Process events
+                async for msg in ws:
+                    if self._stop:
+                        break
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            await self._handle_event(json.loads(msg.data))
+                        except Exception:
+                            logger.exception("Error processing state_changed event")
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        logger.warning("Notif WS connection closed")
+                        break
+
+    async def _handle_event(self, data: dict[str, Any]) -> None:
+        """Process a single state_changed event."""
+        if data.get("type") != "event":
+            return
+        event = data.get("event", {})
+        if event.get("event_type") != "state_changed":
+            return
+
+        event_data = event.get("data", {})
+        entity_id = event_data.get("entity_id", "")
+        if not entity_id:
+            return
+
+        old_state = event_data.get("old_state") or {}
+        new_state = event_data.get("new_state") or {}
+        old_val = old_state.get("state", "")
+        new_val = new_state.get("state", "")
+
+        # Get all active subscriptions for this entity
+        subs = await self._db.get_all_active_notifications()
+        now = time.time()
+
+        for sub in subs:
+            if sub["entity_id"] != entity_id:
+                continue
+
+            # Throttle check
+            if now - sub["last_sent_ts"] < sub["throttle_seconds"]:
+                continue
+
+            mode = sub["mode"]
+
+            # mode=state_only: only notify if state value changed
+            if mode == "state_only":
+                if old_val == new_val:
+                    continue
+
+            # mode=state_and_key_attrs: also check key attributes
+            elif mode == "state_and_key_attrs":
+                domain = entity_id.split(".", 1)[0]
+                key_attrs = _KEY_ATTRS.get(domain, frozenset())
+                state_changed = old_val != new_val
+                attrs_changed = False
+                if key_attrs:
+                    old_attrs = old_state.get("attributes", {})
+                    new_attrs = new_state.get("attributes", {})
+                    for attr in key_attrs:
+                        if old_attrs.get(attr) != new_attrs.get(attr):
+                            attrs_changed = True
+                            break
+                if not state_changed and not attrs_changed:
+                    continue
+
+            # Build notification text
+            friendly = new_state.get("attributes", {}).get("friendly_name", entity_id)
+            ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            text = (
+                f"\U0001f514 <b>{_sanitize(friendly)}</b>\n"
+                f"{_sanitize(old_val)} \u2192 {_sanitize(new_val)}\n"
+                f"<i>{ts} UTC</i>"
+            )
+
+            # Add key attr changes if relevant
+            if mode == "state_and_key_attrs":
+                domain = entity_id.split(".", 1)[0]
+                key_attrs = _KEY_ATTRS.get(domain, frozenset())
+                old_attrs = old_state.get("attributes", {})
+                new_attrs = new_state.get("attributes", {})
+                changes = []
+                for attr in sorted(key_attrs):
+                    ov = old_attrs.get(attr)
+                    nv = new_attrs.get(attr)
+                    if ov != nv:
+                        changes.append(f"  {attr}: {ov} \u2192 {nv}")
+                if changes:
+                    text += "\n" + "\n".join(changes)
+
+            await self._send_notification(sub["user_id"], text)
+            await self._db.update_notification_sent(sub["user_id"], entity_id)
+
+    async def _send_notification(self, user_id: int, text: str) -> None:
+        """Send notification message to user. user_id is used as chat_id for private chats."""
+        try:
+            await self._bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode="HTML",
+            )
+        except TelegramRetryAfter as e:
+            logger.warning("Notification rate limited, wait %ss for user %s", e.retry_after, user_id)
+            await asyncio.sleep(e.retry_after)
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logger.warning("Cannot send notification to %s: %s", user_id, exc)
+        except Exception:
+            logger.exception("Failed to send notification to %s", user_id)
