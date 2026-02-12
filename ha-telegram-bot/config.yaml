@@ -1,7 +1,7 @@
 name: "Home Assistant Telegram Bot"
-version: "2.0.2"
+version: "2.1.0"
 slug: ha_telegram_bot
-description: "Interactive Telegram bot with multi-level menus, dynamic device discovery, and vacuum room targeting for Home Assistant"
+description: "Interactive Telegram bot with floors/areas navigation, vacuum room targeting, Roborock routines, favorites, notifications, and dynamic device discovery for Home Assistant"
 image: "ghcr.io/beerlogger01/ha-bot-ha-telegram-bot-{arch}"
 arch:
   - amd64
@@ -60,9 +60,9 @@ schema:
   menu_page_size: int(1,20)
   show_all_enabled: bool
   vacuum_room_strategy: str
-  vacuum_room_script_entity_id: str
+  vacuum_room_script_entity_id: str?
   vacuum_room_presets:
     - str
-  light_entity_id: str
-  vacuum_entity_id: str
-  goodnight_scene_id: str
+  light_entity_id: str?
+  vacuum_entity_id: str?
+  goodnight_scene_id: str?

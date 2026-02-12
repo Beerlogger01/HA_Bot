@@ -1,14 +1,15 @@
 # Home Assistant Telegram Bot Add-on
 
-A secure, interactive Telegram bot for controlling Home Assistant devices. Features multi-level inline menus, dynamic entity discovery, vacuum room targeting, rate limiting, and audit logging.
+A secure, interactive Telegram bot for controlling Home Assistant devices. Features floors/areas navigation, vacuum room targeting, Roborock routines, per-user favorites, entity notifications, and dynamic device discovery.
 
 ## Features
 
-- **Multi-level menus**: Interactive inline button navigation (Devices, Scenes, Robots, Status, Help)
-- **Dynamic device discovery**: Automatically discovers entities from Home Assistant
-- **Domain filtering & pagination**: Filter by domain allowlist, paginate large entity lists
-- **Entity control**: Domain-specific controls (ON/OFF, brightness, temperature, covers, etc.)
-- **Vacuum room targeting**: Room-based cleaning with configurable strategy (script or service_data)
+- **Floors & Areas navigation**: Automatic sync of HA Floor/Area/Device/Entity registries via WebSocket API
+- **Dynamic device discovery**: Entities organized by floors -> areas -> devices with domain filtering
+- **Vacuum room targeting**: Segment-based cleaning with auto-detection + configurable presets
+- **Roborock routines**: Automatic discovery of routine button entities on vacuum devices
+- **Per-user favorites**: Star entities for quick access
+- **Entity notifications**: Subscribe to state changes with throttling and mode selection
 - **Clean message behavior**: Edit-in-place menus, no message clutter
 - **Security**: Whitelist-based chat and user authorization, deny-by-default
 - **Rate limiting**: Per-user cooldowns and global rate limits
@@ -109,9 +110,6 @@ vacuum_room_presets:
   - kitchen
   - living_room
   - bedroom
-light_entity_id: ""
-vacuum_entity_id: ""
-goodnight_scene_id: ""
 ```
 
 #### Configuration Options
@@ -120,20 +118,19 @@ goodnight_scene_id: ""
 |--------|-------------|----------|---------|
 | `bot_token` | Telegram bot token from BotFather | Yes | - |
 | `allowed_chat_id` | Chat ID (negative for supergroup, positive for private). `0` = any chat. | No | 0 |
-| `allowed_user_ids` | List of authorized Telegram user IDs. Empty = any user. | No | `[]` |
+| `allowed_user_ids` | List of authorized Telegram user IDs. Empty = any user. Accepts single int too. | No | `[]` |
 | `cooldown_seconds` | Per-user action cooldown in seconds | No | 2 |
 | `global_rate_limit_actions` | Max actions per time window | No | 10 |
 | `global_rate_limit_window` | Time window in seconds | No | 5 |
 | `status_entities` | Entities to show in Status menu | No | `[]` |
-| `menu_domains_allowlist` | Entity domains shown in Devices menu | No | see above |
+| `menu_domains_allowlist` | Entity domains shown in menus | No | see above |
 | `menu_page_size` | Entities per page (1-20) | No | 8 |
 | `show_all_enabled` | Allow users to toggle "Show All" domains | No | `false` |
 | `vacuum_room_strategy` | Room targeting mode: `script` or `service_data` | No | `service_data` |
 | `vacuum_room_script_entity_id` | Script entity for room cleaning (script mode) | No | `""` |
 | `vacuum_room_presets` | Predefined room names for vacuum targeting | No | see above |
-| `light_entity_id` | Legacy: single light entity | No | `""` |
-| `vacuum_entity_id` | Legacy: single vacuum entity | No | `""` |
-| `goodnight_scene_id` | Legacy: single scene entity | No | `""` |
+
+Legacy options (`light_entity_id`, `vacuum_entity_id`, `goodnight_scene_id`) are kept for backward compatibility but are optional and not required for any functionality.
 
 ### 7. Start the Add-on
 
@@ -144,10 +141,14 @@ goodnight_scene_id: ""
 
 Expected log output:
 ```
-[INFO] Starting Home Assistant Telegram Bot...
-[INFO] Configuration loaded successfully
-[INFO] Starting bot application...
+[INFO] Loading configuration...
 [INFO] HA API self-test passed — version 2024.x.x
+[INFO] Starting registry sync...
+[INFO] WS authenticated, fetching registries...
+[INFO] Registry sync OK: N floors, N areas, N devices, N entities
+[INFO] Vacuum vacuum.roborock: N routines
+[INFO] Notification listener started
+[INFO] Bot initialized — @your_bot (id=123456789)
 [INFO] Bot polling started
 ```
 
@@ -155,26 +156,39 @@ Expected log output:
 
 ### Commands
 
-- `/start` - Show welcome message and main menu
-- `/menu` - Show main menu (alias for /start)
-- `/status` - Show status of configured entities
+- `/start` — Show main menu
+- `/menu` — Show main menu (alias for /start)
+- `/status` — Show status of configured entities
+- `/ping` — Liveness check (pong + HA version + timestamp)
 
 ### Main Menu
 
 The main menu provides five categories:
 
-- **Devices** - Browse all HA entities by domain (lights, switches, etc.)
-- **Scenes** - List and activate HA scenes
-- **Robots** - Control vacuum robots with room targeting
-- **Status** - View current state of configured entities
-- **Help** - Usage instructions
+- **Управление** — Browse devices by Floors -> Areas -> Entities with domain-specific controls
+- **Избранное** — Quick access to starred entities
+- **Уведомления** — Manage state change subscriptions
+- **Обновить** — Re-sync floors, areas, devices, entities from HA
+- **Статус** — View current state of configured entities
 
-### Navigation
+### Navigation Flow
 
-- All menus use **edit-in-place**: pressing a button updates the existing message instead of sending a new one
-- Every submenu has a **Back** button for navigation
-- If message editing fails (message too old), the bot deletes the old message and sends a new one
-- The bot tracks the current menu message per chat in SQLite
+```
+Main Menu
+├── Управление
+│   ├── Пространства (if floors exist)
+│   │   ├── Floor 1 -> Areas -> Entities -> Controls
+│   │   └── Floor 2 -> Areas -> Entities -> Controls
+│   └── Комнаты (if no floors)
+│       ├── Area 1 -> Entities -> Controls
+│       └── Без комнаты -> Unassigned entities
+├── Избранное -> Starred entities -> Controls
+├── Уведомления -> Subscribed entities -> Toggle/Mode
+├── Обновить -> Re-sync registries
+└── Статус -> Status entities
+```
+
+All menus use **edit-in-place**: pressing a button updates the existing message instead of sending a new one.
 
 ### Entity Controls
 
@@ -186,12 +200,29 @@ Each entity type gets domain-specific controls:
 | `switch` | ON / OFF / Toggle |
 | `cover` | Open / Stop / Close |
 | `climate` | Temperature +/- |
-| `vacuum` | Start / Stop / Return to Base / Room Cleaning |
+| `vacuum` | Start / Pause / Stop / Dock / Locate / Room Cleaning / Routines |
 | `scene` | Activate |
 | `script` | Activate |
 | `fan` | ON / OFF / Toggle |
 | `lock` | Lock / Unlock |
+| `button` | Press |
 | `media_player` | Play / Pause / Stop |
+
+Every entity card includes:
+- **Star** button — Add/remove from favorites
+- **Bell** button — Subscribe/unsubscribe to state change notifications
+
+## Floors & Areas
+
+The bot automatically syncs with Home Assistant's Floor, Area, Device, and Entity registries via WebSocket API.
+
+- **Floors/Spaces** group Areas (e.g., "First Floor", "Second Floor")
+- **Areas/Rooms** group entities (e.g., "Kitchen", "Bedroom")
+- Entities are mapped to areas through the entity registry or device registry
+- If no floors exist, the bot skips directly to the areas list
+- Entities without an assigned area appear under "Без комнаты"
+
+Default rooms (Kitchen, Living Room, Bedroom, Hallway, Bathroom) are matched to HA areas using RU/EN aliases.
 
 ## Vacuum Room Targeting
 
@@ -199,7 +230,7 @@ The bot supports room-based vacuum cleaning with two strategies:
 
 ### Strategy: `service_data` (default)
 
-Sends a `vacuum.send_command` service call with room information:
+Sends a `vacuum.send_command` service call with segment IDs:
 ```yaml
 service: vacuum.send_command
 data:
@@ -209,8 +240,6 @@ data:
     rooms:
       - bathroom
 ```
-
-This works with many vacuum integrations that support segment cleaning (e.g., Roborock, Dreame, Xiaomi).
 
 ### Strategy: `script`
 
@@ -224,58 +253,27 @@ data:
     room: bathroom
 ```
 
-This is the most flexible approach. Create a script in HA that handles room-to-segment mapping for your specific vacuum:
+### Roborock Routines
 
-```yaml
-# configuration.yaml or scripts.yaml
-script:
-  vacuum_clean_room:
-    alias: "Vacuum Clean Room"
-    sequence:
-      - choose:
-          - conditions:
-              - condition: template
-                value_template: "{{ room == 'bathroom' }}"
-            sequence:
-              - service: vacuum.send_command
-                target:
-                  entity_id: "{{ vacuum_entity }}"
-                data:
-                  command: app_segment_clean
-                  params:
-                    segments: [16]
-          - conditions:
-              - condition: template
-                value_template: "{{ room == 'kitchen' }}"
-            sequence:
-              - service: vacuum.send_command
-                target:
-                  entity_id: "{{ vacuum_entity }}"
-                data:
-                  command: app_segment_clean
-                  params:
-                    segments: [17]
-```
+The bot automatically discovers Roborock routine button entities by finding `button.*` entities that belong to the same device as `vacuum.*` entities. Routines appear as a "Сценарии" menu item in the vacuum control card.
 
-### Configuration
+## Favorites
 
-```yaml
-vacuum_room_strategy: "script"           # or "service_data"
-vacuum_room_script_entity_id: "script.vacuum_clean_room"
-vacuum_room_presets:
-  - bathroom
-  - kitchen
-  - living_room
-  - bedroom
-  - hallway
-```
+- Add any entity to favorites using the Star button in its control card
+- Access favorites from the main menu
+- Per-user storage (each user has their own favorites list)
+- Paginated list with quick access to entity controls
 
-### Capability Notes
+## Notifications
 
-- The bot discovers all vacuum entities from Home Assistant automatically
-- Room presets are configurable (not auto-detected, since room names/segments vary per vendor)
-- If a vacuum does not support room cleaning, the Start button still works (starts full cleaning)
-- The Stop and Return to Base buttons are always available
+- Subscribe to state changes for any entity using the Bell button
+- Per-user, per-entity subscriptions stored in SQLite
+- **Modes**:
+  - `state_only` (default) — Only notify when the state value changes
+  - `state_and_key_attrs` — Also notify on key attribute changes (battery, temperature, etc.)
+- **Throttling**: Minimum 60 seconds between notifications per entity per user
+- Notifications are sent as a separate message (not in the menu)
+- Persistent WebSocket connection to HA for real-time event processing
 
 ## Security Features
 
@@ -287,7 +285,7 @@ If `allowed_chat_id` is set to `0` (the default), the bot accepts commands from 
 
 If `allowed_user_ids` is empty `[]` (the default), the bot accepts commands from **any user** (open mode). Add specific user IDs to restrict access.
 
-These are "open mode" defaults so the bot works out-of-the-box. You can tighten security at any time by setting a specific chat ID and adding user IDs.
+The bot flexibly handles `allowed_user_ids` input — if a single integer is provided instead of a list, it is automatically wrapped into a list.
 
 ### Rate Limiting
 
@@ -296,27 +294,33 @@ Two layers of protection:
 1. **Per-user cooldown**: Checked first. Prevents spam (default 2 seconds per action per user)
 2. **Global rate limit**: Checked second. Only counts successful attempts (default 10 actions per 5 seconds)
 
-## Audit Logging
+## Architecture
 
-All actions are logged to:
+The bot is built with a modular architecture:
 
-1. **stdout** (viewable in Add-on Log tab):
-   ```json
-   {
-     "ts": "2026-02-11T10:30:45",
-     "level": "INFO",
-     "logger": "ha_bot.handlers",
-     "msg": "AUDIT",
-     "chat_id": -1001234567890,
-     "user_id": 123456789,
-     "action": "light.turn_on",
-     "ok": true
-   }
-   ```
+```
+app/
+  app.py           — Main entrypoint, config loading, bot lifecycle
+  api.py           — Home Assistant REST API client with retries
+  registry.py      — HA WebSocket registry sync (floors/areas/devices/entities)
+  notifications.py — State change notification system (WS subscribe + dispatch)
+  storage.py       — SQLite database (8 tables)
+  handlers.py      — Telegram command and callback handlers with route table
+  ui.py            — Inline keyboard menu builders
+```
 
-2. **SQLite database** (`/data/bot.sqlite3`):
-   - Full history with timestamps, entity IDs, and errors
-   - Survives restarts
+## Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `cooldowns` | Per-user action cooldown tracking |
+| `audit` | Action audit trail |
+| `menu_state` | Per-chat menu message tracking for edit-in-place |
+| `favorites` | Per-user entity bookmarks |
+| `rooms` | Canonical room names with HA area mapping and aliases |
+| `entity_area_cache` | Cached entity->area->floor mapping from registry |
+| `vacuum_room_map` | Vacuum segment_id to area mapping |
+| `notifications` | Per-user entity notification preferences |
 
 ## Troubleshooting
 
@@ -327,32 +331,32 @@ All actions are logged to:
 3. Ensure `allowed_chat_id` matches your chat ID
 4. Make sure your user ID is in `allowed_user_ids`
 
-### "Unauthorized chat" error
+### No floors/areas shown
 
-- Double-check your `allowed_chat_id`
-- Supergroups use negative IDs starting with `-100`
-- Private chats use your positive user ID
-- Get the ID again using the `/getUpdates` method
+- Ensure you have areas configured in Home Assistant (Settings -> Areas)
+- Floors require HA 2024.x+
+- Press "Обновить" in the bot to re-sync registries
+- Check logs for "Registry sync" messages
 
-### "You are not authorized" error
+### No Roborock routines found
 
-- Verify your user ID is in `allowed_user_ids` array
-- Check for typos in user IDs
-- User IDs are positive integers
-
-### No entities shown in Devices menu
-
-- Verify Home Assistant is running and accessible
-- Check that `menu_domains_allowlist` includes the correct domains
-- Try enabling `show_all_enabled: true` to see all domains
-- Check add-on logs for HA API errors
+- Routines must be enabled in the Roborock app and synced to HA
+- They appear as `button.*` entities on the vacuum device
+- Check that button entities are not disabled in HA entity registry
 
 ### Vacuum room cleaning doesn't work
 
 - Verify your vacuum supports segment/room cleaning
 - If using `script` strategy: ensure the script entity exists and handles your room names
-- If using `service_data` strategy: the default sends `app_segment_clean` which works with Roborock/Xiaomi. Other brands may need the `script` strategy with custom logic
+- If using `service_data` strategy: the default sends `app_segment_clean` which works with Roborock/Xiaomi
 - Check HA logs for service call errors
+
+### Notifications not working
+
+- Ensure the bot can send messages to you (start a private chat with the bot first)
+- Check add-on logs for "Notification WS" messages
+- Verify the entity exists and changes state
+- Default throttle is 60 seconds per entity
 
 ### Home Assistant API errors
 
@@ -363,31 +367,12 @@ Check logs for HTTP error codes:
 - **500**: Home Assistant internal error - check HA logs
 - **Timeout**: HA is slow or restarting - the bot retries automatically
 
-### Message editing fails
-
-- This is normal for messages older than 48 hours
-- The bot automatically falls back to delete + resend
-- If the bot loses permissions in the chat, re-add it
-
-## Architecture
-
-The bot is built with a modular architecture:
-
-```
-app/
-  app.py       - Main entrypoint, config loading, bot lifecycle
-  api.py       - Home Assistant API client with retries
-  storage.py   - SQLite database for cooldowns, audit, menu state
-  handlers.py  - Telegram command and callback handlers
-  ui.py        - Inline keyboard menu builders
-```
-
 ## Persistence
 
 All persistent data is stored in `/data/`:
 
 - `/data/options.json` - Add-on configuration (managed by Supervisor)
-- `/data/bot.sqlite3` - Audit logs, cooldown state, menu state
+- `/data/bot.sqlite3` - All database tables
 
 Data survives add-on restarts and updates.
 
