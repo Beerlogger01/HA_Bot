@@ -7,7 +7,10 @@ Features:
 - Floors / Areas / Entities navigation via HA registries
 - Vacuum room targeting (segments) + Roborock routines
 - Per-user favorites and notification subscriptions
-- Edit-in-place message cleanup
+- Favorite actions, snapshots, scheduler, search
+- Role-based access control (admin/user/guest)
+- Diagnostics: /health /diag /trace_last_error
+- Edit-in-place message cleanup + forum thread support
 - Security: chat/user whitelisting, deny-by-default
 - Rate limiting: per-user cooldown + global sliding window
 - Audit logging: structured JSON stdout + SQLite
@@ -30,10 +33,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 
 from api import HAClient
+from diagnostics import Diagnostics, ErrorCapture
 from handlers import GlobalRateLimiter, Handlers
 from notifications import NotificationManager
 from registry import HARegistry
+from scheduler import Scheduler
 from storage import Database
+from vacuum_adapter import VacuumAdapter
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -264,20 +270,18 @@ class TelegramBot:
             config.global_rate_limit_actions,
             config.global_rate_limit_window,
         )
-        self._handlers = Handlers(
-            bot=self._bot,
+        self._vacuum = VacuumAdapter(
             ha=self._ha,
             db=self._db,
-            config=config,
-            global_rl=self._global_rl,
             registry=self._registry,
+            strategy=config.vacuum_room_strategy,
+            script_entity_id=config.vacuum_room_script_entity_id,
+            presets=config.vacuum_room_presets,
         )
-
-        self._dp.message.register(self._handlers.cmd_start, Command("start"))
-        self._dp.message.register(self._handlers.cmd_start, Command("menu"))
-        self._dp.message.register(self._handlers.cmd_status, Command("status"))
-        self._dp.message.register(self._handlers.cmd_ping, Command("ping"))
-        self._dp.callback_query.register(self._handlers.handle_callback)
+        self._scheduler = Scheduler(self._ha, self._db)
+        self._diagnostics: Diagnostics | None = None
+        self._error_capture: ErrorCapture | None = None
+        self._handlers: Handlers | None = None
 
     async def run(self) -> None:
         await self._db.open()
@@ -291,8 +295,6 @@ class TelegramBot:
             logger.info("HA API self-test passed — version %s", ha_version)
         else:
             logger.error("HA API self-test FAILED — check SUPERVISOR_TOKEN / network")
-
-        self._handlers.ha_version = ha_version
 
         # Registry sync
         logger.info("Starting registry sync...")
@@ -310,8 +312,54 @@ class TelegramBot:
         else:
             logger.warning("Registry sync failed — bot will work with limited navigation")
 
-        # Start notification listener
+        # Diagnostics
+        self._diagnostics = Diagnostics(
+            ha=self._ha, db=self._db, registry=self._registry,
+            ha_version=ha_version,
+        )
+
+        # Error capture handler — writes ERROR+ logs to DB ring buffer
+        self._error_capture = ErrorCapture(self._db)
+        self._error_capture.set_loop(asyncio.get_running_loop())
+        logging.getLogger().addHandler(self._error_capture)
+
+        # Handlers
+        self._handlers = Handlers(
+            bot=self._bot,
+            ha=self._ha,
+            db=self._db,
+            config=self._config,
+            global_rl=self._global_rl,
+            registry=self._registry,
+            vacuum=self._vacuum,
+            diagnostics=self._diagnostics,
+            scheduler=self._scheduler,
+        )
+        self._handlers.ha_version = ha_version
+
+        # Register commands
+        self._dp.message.register(self._handlers.cmd_start, Command("start"))
+        self._dp.message.register(self._handlers.cmd_start, Command("menu"))
+        self._dp.message.register(self._handlers.cmd_status, Command("status"))
+        self._dp.message.register(self._handlers.cmd_ping, Command("ping"))
+        self._dp.message.register(self._handlers.cmd_search, Command("search"))
+        self._dp.message.register(self._handlers.cmd_health, Command("health"))
+        self._dp.message.register(self._handlers.cmd_diag, Command("diag"))
+        self._dp.message.register(self._handlers.cmd_trace, Command("trace_last_error"))
+        self._dp.message.register(self._handlers.cmd_snapshot, Command("snapshot"))
+        self._dp.message.register(self._handlers.cmd_snapshots, Command("snapshots"))
+        self._dp.message.register(self._handlers.cmd_schedule, Command("schedule"))
+        self._dp.message.register(self._handlers.cmd_role, Command("role"))
+        self._dp.message.register(self._handlers.cmd_export_settings, Command("export_settings"))
+        self._dp.message.register(self._handlers.cmd_import_settings, Command("import_settings"))
+        self._dp.message.register(self._handlers.cmd_notify_test, Command("notify_test"))
+        self._dp.callback_query.register(self._handlers.handle_callback)
+        # Text search handler (must be last — catches all text messages)
+        self._dp.message.register(self._handlers.handle_text_search)
+
+        # Start background services
         await self._notif.start()
+        await self._scheduler.start()
 
         # Bot identity
         try:
@@ -329,7 +377,7 @@ class TelegramBot:
         user_count = len(self._config.allowed_user_ids)
         user_mode = f"{user_count} allowed user(s)" if user_count > 0 else "any user"
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
-        logger.info("Bot polling started")
+        logger.info("Bot polling started (v2.2.0)")
 
         await self._dp.start_polling(
             self._bot,
@@ -338,7 +386,13 @@ class TelegramBot:
 
     async def shutdown(self) -> None:
         errors: list[str] = []
+
+        # Remove error capture handler
+        if self._error_capture is not None:
+            logging.getLogger().removeHandler(self._error_capture)
+
         for label, coro in [
+            ("scheduler", self._scheduler.stop()),
             ("notifications", self._notif.stop()),
             ("HA session", self._ha.close()),
             ("database", self._db.close()),
