@@ -6,8 +6,12 @@ Callback data format: "prefix:payload" (max 64 bytes per Telegram limit).
 Menu tree:
   Main -> Управление -> (Floors?) -> Areas -> Entities -> Controls
   Main -> Избранное -> Entities -> Controls
+  Main -> Избранное -> Быстрые действия
   Main -> Уведомления -> Entities -> toggle/mode
   Main -> Обновить / Статус
+  Main -> Расписание -> list/add/toggle/delete
+  Main -> Поиск -> results -> entity controls
+  Main -> Диагностика -> health/debug/trace
 """
 
 from __future__ import annotations
@@ -93,6 +97,10 @@ def build_main_menu() -> tuple[str, InlineKeyboardMarkup]:
         [
             InlineKeyboardButton(text="\u2b50 Избранное", callback_data="menu:favorites"),
             InlineKeyboardButton(text="\U0001f514 Уведомления", callback_data="menu:notif"),
+        ],
+        [
+            InlineKeyboardButton(text="\U0001f50d Поиск", callback_data="menu:search"),
+            InlineKeyboardButton(text="\u23f0 Расписание", callback_data="menu:schedule"),
         ],
         [
             InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:refresh"),
@@ -312,7 +320,6 @@ def _control_buttons(
             InlineKeyboardButton(text="\U0001f3e0 Док", callback_data=f"act:{entity_id}:return_to_base"),
             InlineKeyboardButton(text="\U0001f4cd Найти", callback_data=f"act:{entity_id}:locate"),
         ])
-        # Room cleaning + routines — added via handler, not here (needs state)
 
     elif domain in ("scene", "script"):
         rows.append([InlineKeyboardButton(
@@ -421,7 +428,7 @@ def build_vacuum_routines(
 
 
 # ---------------------------------------------------------------------------
-# Favorites
+# Favorites — entities + actions
 # ---------------------------------------------------------------------------
 
 
@@ -429,20 +436,87 @@ def build_favorites_menu(
     entities: list[dict[str, Any]],
     page: int,
     page_size: int,
+    fav_actions: list[dict[str, Any]] | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    if not entities:
+    if not entities and not fav_actions:
         text = "\u2b50 <b>Избранное</b>\n\nСписок пуст."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
         ])
         return text, kb
 
-    return build_entity_list(
+    # If there are favorite actions, show a tab button
+    extra_rows: list[list[InlineKeyboardButton]] = []
+    if fav_actions:
+        extra_rows.append([InlineKeyboardButton(
+            text=f"\u26a1 Быстрые действия ({len(fav_actions)})",
+            callback_data="menu:fav_actions",
+        )])
+
+    t, k = build_entity_list(
         entities, page, page_size,
         title="\u2b50 <b>Избранное</b>",
         back_cb="nav:main",
         page_cb_prefix="favp",
     )
+    if extra_rows:
+        rows = k.inline_keyboard[:]
+        # Insert before the Back button
+        insert_pos = max(0, len(rows) - 1)
+        for er in extra_rows:
+            rows.insert(insert_pos, er)
+        k = InlineKeyboardMarkup(inline_keyboard=rows)
+
+    return t, k
+
+
+def build_fav_actions_menu(
+    actions: list[dict[str, Any]],
+    page: int = 0,
+    page_size: int = 8,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build favorite actions list."""
+    text = "\u26a1 <b>Быстрые действия</b>\n\n"
+    if not actions:
+        text += "Нет сохранённых действий."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="\u2b05 Назад", callback_data="menu:favorites")],
+        ])
+        return text, kb
+
+    total = len(actions)
+    total_pages = max(1, math.ceil(total / page_size))
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    end = min(start + page_size, total)
+    page_acts = actions[start:end]
+
+    text += f"Стр. {page + 1}/{total_pages}\n"
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for act in page_acts:
+        label = act.get("label", act.get("action_type", "?"))
+        rows.append([
+            InlineKeyboardButton(
+                text=f"\u26a1 {_trunc(label, 22)}",
+                callback_data=f"fa_run:{act['id']}",
+            ),
+            InlineKeyboardButton(
+                text="\U0001f5d1",
+                callback_data=f"fa_del:{act['id']}",
+            ),
+        ])
+
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="\u25c0", callback_data=f"fap:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="\u25b6", callback_data=f"fap:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="menu:favorites")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +598,174 @@ def build_status_menu(entities: list[dict[str, Any]]) -> tuple[str, InlineKeyboa
 
 
 # ---------------------------------------------------------------------------
+# Search results
+# ---------------------------------------------------------------------------
+
+
+def build_search_prompt() -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        "\U0001f50d <b>Поиск</b>\n\n"
+        "Отправьте запрос в чат для поиска устройств.\n"
+        "Или используйте: /search <i>запрос</i>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+    ])
+    return text, kb
+
+
+def build_search_results(
+    query: str,
+    entities: list[dict[str, Any]],
+    page: int = 0,
+    page_size: int = 8,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build search results page."""
+    if not entities:
+        text = f"\U0001f50d <b>Поиск:</b> {_sanitize(query)}\n\nНичего не найдено."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+        ])
+        return text, kb
+
+    return build_entity_list(
+        entities, page, page_size,
+        title=f"\U0001f50d <b>Поиск:</b> {_sanitize(query)} ({len(entities)})",
+        back_cb="nav:main",
+        page_cb_prefix="srp",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Snapshots
+# ---------------------------------------------------------------------------
+
+
+def build_snapshots_list(
+    snapshots: list[dict[str, Any]],
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = "\U0001f4f8 <b>Снимки состояний</b>\n\n"
+    if not snapshots:
+        text += "Нет сохранённых снимков.\nИспользуйте /snapshot для создания."
+    else:
+        text += f"Всего: {len(snapshots)}\n"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for snap in snapshots[:10]:
+        label = f"{snap['name']} ({snap['created_at'][:16]})"
+        rows.append([
+            InlineKeyboardButton(
+                text=_trunc(label, 32),
+                callback_data=f"snap:{snap['id']}",
+            ),
+            InlineKeyboardButton(
+                text="\U0001f5d1",
+                callback_data=f"snapdel:{snap['id']}",
+            ),
+        ])
+
+    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_snapshot_detail(
+    snapshot: dict[str, Any],
+    diff_text: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        f"\U0001f4f8 <b>{_sanitize(snapshot['name'])}</b>\n"
+        f"Created: {snapshot['created_at'][:19]}\n"
+        f"Entities: {len(snapshot.get('payload', []))}\n"
+    )
+    if diff_text:
+        text += f"\n<b>Changes since snapshot:</b>\n{diff_text}"
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text="\U0001f504 Diff with current",
+            callback_data=f"snapdiff:{snapshot['id']}",
+        )],
+        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="menu:snapshots")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# Schedule
+# ---------------------------------------------------------------------------
+
+
+def build_schedule_list(
+    schedules: list[dict[str, Any]],
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = "\u23f0 <b>Расписание</b>\n\n"
+    if not schedules:
+        text += "Нет задач.\nИспользуйте /schedule add для создания."
+    else:
+        for s in schedules[:10]:
+            icon = "\u2705" if s.get("enabled") else "\u274c"
+            lr = s.get("last_result") or "\u2014"
+            text += f"{icon} <b>{_sanitize(s['name'])}</b> [{s['cron_expr']}]\n"
+            text += f"  Результат: {_sanitize(str(lr)[:60])}\n"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for s in schedules[:10]:
+        toggle_label = "\u23f8" if s.get("enabled") else "\u25b6"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{toggle_label} {_trunc(s['name'], 18)}",
+                callback_data=f"schtog:{s['id']}",
+            ),
+            InlineKeyboardButton(
+                text="\U0001f5d1",
+                callback_data=f"schdel:{s['id']}",
+            ),
+        ])
+
+    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+
+def build_diagnostics_menu(
+    diag_text: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(text="\U0001f504 Refresh", callback_data="diag:refresh"),
+            InlineKeyboardButton(text="\U0001f534 Last Error", callback_data="diag:trace"),
+        ],
+        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+    ]
+    return diag_text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+
+
+def build_roles_list(
+    roles: list[dict[str, Any]],
+) -> tuple[str, InlineKeyboardMarkup]:
+    text = "\U0001f464 <b>Роли пользователей</b>\n\n"
+    if not roles:
+        text += "Роли не настроены (все пользователи = user)."
+    else:
+        for r in roles:
+            text += f"\u2022 <code>{r['user_id']}</code>: <b>{r['role']}</b>\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+    ])
+    return text, kb
+
+
+# ---------------------------------------------------------------------------
 # Confirmation / Result
 # ---------------------------------------------------------------------------
 
@@ -550,11 +792,21 @@ def build_help_menu() -> tuple[str, InlineKeyboardMarkup]:
         "/start \u2014 Главное меню\n"
         "/menu \u2014 Главное меню\n"
         "/ping \u2014 Проверка связи\n"
-        "/status \u2014 Статус устройств\n\n"
+        "/status \u2014 Статус устройств\n"
+        "/search <i>запрос</i> \u2014 Поиск устройств\n"
+        "/snapshot \u2014 Снимок состояний\n"
+        "/snapshots \u2014 Список снимков\n"
+        "/schedule \u2014 Расписание\n"
+        "/health \u2014 Проверка здоровья\n"
+        "/diag \u2014 Диагностика\n"
+        "/role \u2014 Управление ролями (admin)\n"
+        "/export_settings \u2014 Экспорт настроек\n\n"
         "<b>Навигация:</b>\n"
         "\u2022 <b>Управление</b> \u2014 Пространства \u2192 Комнаты \u2192 Устройства \u2192 Функции\n"
         "\u2022 <b>Избранное</b> \u2014 Быстрый доступ к часто используемым\n"
-        "\u2022 <b>Уведомления</b> \u2014 Подписки на изменения состояний\n\n"
+        "\u2022 <b>Уведомления</b> \u2014 Подписки на изменения состояний\n"
+        "\u2022 <b>Поиск</b> \u2014 Быстрый поиск по имени\n"
+        "\u2022 <b>Расписание</b> \u2014 Периодические действия\n\n"
         "Все меню обновляются в одном сообщении."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
