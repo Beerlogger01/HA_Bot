@@ -41,14 +41,6 @@ ROOM_ALIASES: dict[str, list[str]] = {
     "столовая": ["dining_room", "dining"],
 }
 
-DEFAULT_ROOMS: list[dict[str, Any]] = [
-    {"canonical_name": "Кухня", "aliases": ["кухня", "kitchen"]},
-    {"canonical_name": "Гостиная", "aliases": ["гостиная", "living_room", "living room", "зал"]},
-    {"canonical_name": "Спальня", "aliases": ["спальня", "bedroom"]},
-    {"canonical_name": "Прихожка", "aliases": ["прихожка", "прихожая", "коридор", "hallway", "corridor"]},
-    {"canonical_name": "Ванная", "aliases": ["ванная", "bathroom", "ванна"]},
-]
-
 
 def _normalize(name: str) -> str:
     """Lowercase, strip, remove special chars for name matching."""
@@ -211,7 +203,6 @@ class HARegistry:
             self._build_cross_refs()
             self._detect_vacuum_routines()
             await self._populate_entity_area_cache()
-            await self._populate_default_rooms()
             await self._detect_vacuum_segments()
 
             self._synced = True
@@ -446,26 +437,6 @@ class HARegistry:
         await self._db.commit_entity_area_cache()
 
     # -------------------------------------------------------------------
-    # Default rooms
-    # -------------------------------------------------------------------
-
-    async def _populate_default_rooms(self) -> None:
-        """Ensure default rooms exist, matching them to HA areas where possible."""
-        for room_def in DEFAULT_ROOMS:
-            canonical = room_def["canonical_name"]
-            aliases = room_def["aliases"]
-            matched_area_id: str | None = None
-
-            # Try to match to an existing HA area
-            for area in self.areas.values():
-                area_norm = _normalize(area.name)
-                if area_norm in [_normalize(a) for a in aliases] or area_norm == _normalize(canonical):
-                    matched_area_id = area.area_id
-                    break
-
-            await self._db.upsert_room(canonical, matched_area_id, aliases)
-
-    # -------------------------------------------------------------------
     # Query helpers
     # -------------------------------------------------------------------
 
@@ -556,4 +527,134 @@ class HARegistry:
                 for area in self.areas.values():
                     if _normalize(area.name) in all_norm:
                         return area.area_id
+        return None
+
+    # -------------------------------------------------------------------
+    # Device grouping for area menus
+    # -------------------------------------------------------------------
+
+    def _pick_primary_domain(self, entity_ids: list[str]) -> str:
+        """Pick the most relevant domain from a list of entity IDs for icon display."""
+        priority = [
+            "vacuum", "media_player", "climate", "light", "cover", "fan",
+            "switch", "lock", "water_heater", "scene", "script", "select",
+            "number", "button", "sensor", "binary_sensor",
+        ]
+        domains = {eid.split(".", 1)[0] for eid in entity_ids}
+        for d in priority:
+            if d in domains:
+                return d
+        return next(iter(domains), "unknown")
+
+    def get_devices_for_area(
+        self, area_id: str, domains: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Group entities in an area by device_id for display.
+
+        Returns sorted list of dicts:
+          {device_id, name, entity_ids, primary_entity_id, primary_domain, is_vacuum}
+
+        Entities without a device_id get a virtual device_id = entity_id.
+        """
+        area = self.areas.get(area_id)
+        if not area:
+            return []
+
+        raw_eids = area.entity_ids
+        if domains:
+            raw_eids = [e for e in raw_eids if e.split(".", 1)[0] in domains]
+
+        # Group by device_id
+        device_entities: dict[str, list[str]] = {}
+        for eid in raw_eids:
+            ent = self.entities.get(eid)
+            dev_id = ent.device_id if ent and ent.device_id else eid
+            device_entities.setdefault(dev_id, []).append(eid)
+
+        result: list[dict[str, Any]] = []
+        for dev_id, eids in device_entities.items():
+            dev = self.devices.get(dev_id)
+            is_vacuum = any(e.startswith("vacuum.") for e in eids)
+
+            # For vacuum devices, filter out companion entities from the visible list
+            # but keep them internally for the device view
+            if is_vacuum:
+                primary = next((e for e in eids if e.startswith("vacuum.")), eids[0])
+            else:
+                primary = eids[0]
+
+            name = dev.name if dev else self.get_entity_display_name(primary)
+            primary_domain = self._pick_primary_domain(eids)
+
+            result.append({
+                "device_id": dev_id,
+                "name": name,
+                "entity_ids": sorted(eids),
+                "primary_entity_id": primary,
+                "primary_domain": primary_domain,
+                "is_vacuum": is_vacuum,
+            })
+
+        # Sort: vacuums first, then by name
+        result.sort(key=lambda d: (not d["is_vacuum"], d["name"].lower()))
+        return result
+
+    def get_unassigned_devices(
+        self, domains: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Group unassigned entities by device_id (same format as get_devices_for_area)."""
+        unassigned_eids = self.get_unassigned_entities(domains)
+        if not unassigned_eids:
+            return []
+
+        device_entities: dict[str, list[str]] = {}
+        for eid in unassigned_eids:
+            ent = self.entities.get(eid)
+            dev_id = ent.device_id if ent and ent.device_id else eid
+            device_entities.setdefault(dev_id, []).append(eid)
+
+        result: list[dict[str, Any]] = []
+        for dev_id, eids in device_entities.items():
+            dev = self.devices.get(dev_id)
+            is_vacuum = any(e.startswith("vacuum.") for e in eids)
+            primary = next((e for e in eids if e.startswith("vacuum.")), eids[0]) if is_vacuum else eids[0]
+            name = dev.name if dev else self.get_entity_display_name(primary)
+            primary_domain = self._pick_primary_domain(eids)
+            result.append({
+                "device_id": dev_id,
+                "name": name,
+                "entity_ids": sorted(eids),
+                "primary_entity_id": primary,
+                "primary_domain": primary_domain,
+                "is_vacuum": is_vacuum,
+            })
+        result.sort(key=lambda d: (not d["is_vacuum"], d["name"].lower()))
+        return result
+
+    def get_device_entity_ids(
+        self, device_id: str, domains: frozenset[str] | None = None,
+    ) -> list[str]:
+        """Get entity IDs belonging to a device, filtered by domains."""
+        eids: list[str] = []
+        for ent in self.entities.values():
+            if ent.disabled_by:
+                continue
+            if ent.device_id == device_id:
+                if domains and ent.entity_id.split(".", 1)[0] not in domains:
+                    continue
+                eids.append(ent.entity_id)
+        return sorted(eids)
+
+    def is_vacuum_device(self, device_id: str) -> bool:
+        """Check if device has a vacuum entity."""
+        for ent in self.entities.values():
+            if ent.device_id == device_id and ent.entity_id.startswith("vacuum.") and not ent.disabled_by:
+                return True
+        return False
+
+    def get_vacuum_entity_for_device(self, device_id: str) -> str | None:
+        """Get the vacuum entity_id for a device, if any."""
+        for ent in self.entities.values():
+            if ent.device_id == device_id and ent.entity_id.startswith("vacuum.") and not ent.disabled_by:
+                return ent.entity_id
         return None

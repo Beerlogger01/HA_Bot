@@ -61,6 +61,9 @@ DOMAIN_LABELS: dict[str, str] = {
     "lock": "Замки",
     "media_player": "Медиа",
     "button": "Кнопки",
+    "select": "Выбор",
+    "number": "Числа",
+    "water_heater": "Водонагреватели",
 }
 
 
@@ -98,13 +101,10 @@ def build_main_menu() -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="\u2b50 Избранное", callback_data="menu:favorites"),
             InlineKeyboardButton(text="\U0001f514 Уведомления", callback_data="menu:notif"),
         ],
+        [InlineKeyboardButton(text="\U0001f6e0 Диагностика", callback_data="menu:diag")],
         [
             InlineKeyboardButton(text="\U0001f50d Поиск", callback_data="menu:search"),
-            InlineKeyboardButton(text="\u23f0 Расписание", callback_data="menu:schedule"),
-        ],
-        [
             InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:refresh"),
-            InlineKeyboardButton(text="\u2139\ufe0f Статус", callback_data="menu:status"),
         ],
     ])
     return text, kb
@@ -217,6 +217,62 @@ def build_entity_list(
 
 
 # ---------------------------------------------------------------------------
+# Device list (inside area — groups entities by device)
+# ---------------------------------------------------------------------------
+
+
+def build_device_list(
+    devices: list[dict[str, Any]],
+    page: int,
+    page_size: int,
+    title: str,
+    back_cb: str,
+    page_cb_prefix: str = "arp",
+    pin_btn: InlineKeyboardButton | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """devices: [{"device_id", "name", "entity_ids", "primary_entity_id", "primary_domain", "is_vacuum"}, ...]"""
+    total = len(devices)
+    total_pages = max(1, math.ceil(total / page_size))
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    end = min(start + page_size, total)
+    page_devs = devices[start:end]
+
+    text = f"{title} (стр. {page + 1}/{total_pages})\n\nВыберите устройство:"
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for dev in page_devs:
+        did = dev["device_id"]
+        name = dev.get("name", did)
+        domain = dev.get("primary_domain", "unknown")
+        icon = DOMAIN_ICONS.get(domain, "\U0001f4e6")
+        count = len(dev.get("entity_ids", []))
+        suffix = f" ({count})" if count > 1 else ""
+        cb = f"dev:{did}"
+        if len(cb) > 64:
+            cb = f"ent:{dev['primary_entity_id']}"
+        rows.append([InlineKeyboardButton(
+            text=f"{icon} {_trunc(name, 25)}{suffix}",
+            callback_data=cb,
+        )])
+
+    # Pagination
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="\u25c0", callback_data=f"{page_cb_prefix}:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="\u25b6", callback_data=f"{page_cb_prefix}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    if pin_btn:
+        rows.append([pin_btn])
+
+    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
 # Entity control
 # ---------------------------------------------------------------------------
 
@@ -259,6 +315,42 @@ def build_entity_control(
         pos = attrs.get("current_position")
         if pos is not None:
             extra.append(f"Позиция: {pos}%")
+    elif domain == "media_player":
+        mt = attrs.get("media_title")
+        if mt:
+            extra.append(f"Трек: {_sanitize(str(mt)[:60])}")
+        src = attrs.get("source")
+        if src:
+            extra.append(f"Источник: {_sanitize(str(src)[:40])}")
+        vol = attrs.get("volume_level")
+        if vol is not None:
+            extra.append(f"Громкость: {round(float(vol) * 100)}%")
+        muted = attrs.get("is_volume_muted")
+        if muted:
+            extra.append("Звук выключен")
+    elif domain == "sensor":
+        unit = attrs.get("unit_of_measurement", "")
+        if unit:
+            extra.append(f"Ед. изм.: {_sanitize(str(unit))}")
+    elif domain == "select":
+        options = attrs.get("options", [])
+        if options:
+            extra.append(f"Варианты: {len(options)}")
+    elif domain == "number":
+        mn = attrs.get("min")
+        mx = attrs.get("max")
+        step = attrs.get("step")
+        if mn is not None and mx is not None:
+            extra.append(f"Диапазон: {mn} — {mx}")
+        if step is not None:
+            extra.append(f"Шаг: {step}")
+    elif domain == "water_heater":
+        ct = attrs.get("current_temperature")
+        tt = attrs.get("temperature")
+        if ct is not None:
+            extra.append(f"Текущая: {ct}\u00b0")
+        if tt is not None:
+            extra.append(f"Целевая: {tt}\u00b0")
 
     if extra:
         text += "\n" + "\n".join(extra)
@@ -343,6 +435,49 @@ def _control_buttons(
             InlineKeyboardButton(text="\u23f8 Pause", callback_data=f"act:{entity_id}:media_pause"),
             InlineKeyboardButton(text="\u23f9 Stop", callback_data=f"act:{entity_id}:media_stop"),
         ])
+        rows.append([
+            InlineKeyboardButton(text="\U0001f509 Vol\u2212", callback_data=f"mvol:{entity_id}:dn"),
+            InlineKeyboardButton(text="\U0001f50a Vol+", callback_data=f"mvol:{entity_id}:up"),
+            InlineKeyboardButton(
+                text="\U0001f507 Mute" if not attrs.get("is_volume_muted") else "\U0001f508 Unmute",
+                callback_data=f"mmut:{entity_id}",
+            ),
+        ])
+        sources = attrs.get("source_list")
+        if sources and len(sources) > 0:
+            rows.append([InlineKeyboardButton(
+                text="\U0001f4fb Источник", callback_data=f"msrc:{entity_id}",
+            )])
+
+    elif domain == "select":
+        options = attrs.get("options", [])
+        for opt in options[:6]:
+            cb = f"ssel:{entity_id}:{opt}"
+            if len(cb) <= 64:
+                marker = "\u2705 " if state == opt else ""
+                rows.append([InlineKeyboardButton(
+                    text=f"{marker}{_trunc(str(opt), 28)}",
+                    callback_data=cb,
+                )])
+
+    elif domain == "number":
+        rows.append([
+            InlineKeyboardButton(text="\u2b06 +", callback_data=f"nval:{entity_id}:up"),
+            InlineKeyboardButton(text="\u2b07 \u2212", callback_data=f"nval:{entity_id}:dn"),
+        ])
+
+    elif domain == "water_heater":
+        rows.append([
+            InlineKeyboardButton(text="\U0001f7e2 ON", callback_data=f"act:{entity_id}:turn_on"),
+            InlineKeyboardButton(text="\u26aa OFF", callback_data=f"act:{entity_id}:turn_off"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="\u2b06 Темп+", callback_data=f"clim:{entity_id}:up"),
+            InlineKeyboardButton(text="\u2b07 Темп\u2212", callback_data=f"clim:{entity_id}:down"),
+        ])
+
+    elif domain == "sensor":
+        pass  # read-only, no controls
 
     else:
         rows.append([
@@ -428,7 +563,35 @@ def build_vacuum_routines(
 
 
 # ---------------------------------------------------------------------------
-# Favorites — entities + actions
+# Media player source picker
+# ---------------------------------------------------------------------------
+
+
+def build_media_source_menu(
+    entity_id: str,
+    name: str,
+    sources: list[str],
+    current_source: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Source selector for media_player."""
+    text = f"\U0001f4fb <b>{_sanitize(name)}</b>\n\nВыберите источник:"
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for src in sources[:12]:
+        marker = "\u2705 " if src == current_source else ""
+        cb = f"msrs:{entity_id}:{src}"
+        if len(cb) <= 64:
+            rows.append([InlineKeyboardButton(
+                text=f"{marker}{_trunc(str(src), 28)}",
+                callback_data=cb,
+            )])
+
+    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=f"ent:{entity_id}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# Favorites — entities + actions + pinned items
 # ---------------------------------------------------------------------------
 
 
@@ -437,13 +600,32 @@ def build_favorites_menu(
     page: int,
     page_size: int,
     fav_actions: list[dict[str, Any]] | None = None,
+    pinned_items: list[dict[str, Any]] | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    if not entities and not fav_actions:
+    if not entities and not fav_actions and not pinned_items:
         text = "\u2b50 <b>Избранное</b>\n\nСписок пуст."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
         ])
         return text, kb
+
+    # Build pinned items rows (areas, routines) — shown before entity list
+    pinned_rows: list[list[InlineKeyboardButton]] = []
+    if pinned_items:
+        for pin in pinned_items:
+            itype = pin["item_type"]
+            tid = pin["target_id"]
+            label = pin.get("label", tid)
+            if itype == "area":
+                pinned_rows.append([InlineKeyboardButton(
+                    text=f"\U0001f4cc {_trunc(label, 26)}",
+                    callback_data=f"ar:{tid}",
+                )])
+            elif itype == "routine":
+                pinned_rows.append([InlineKeyboardButton(
+                    text=f"\U0001f3ac {_trunc(label, 26)}",
+                    callback_data=f"rtn:{tid}",
+                )])
 
     # If there are favorite actions, show a tab button
     extra_rows: list[list[InlineKeyboardButton]] = []
@@ -459,14 +641,18 @@ def build_favorites_menu(
         back_cb="nav:main",
         page_cb_prefix="favp",
     )
-    if extra_rows:
-        rows = k.inline_keyboard[:]
-        # Insert before the Back button
-        insert_pos = max(0, len(rows) - 1)
-        for er in extra_rows:
-            rows.insert(insert_pos, er)
-        k = InlineKeyboardMarkup(inline_keyboard=rows)
+    rows = k.inline_keyboard[:]
 
+    # Insert pinned items and action buttons before the Back button
+    insert_pos = max(0, len(rows) - 1)
+    for pr in pinned_rows:
+        rows.insert(insert_pos, pr)
+        insert_pos += 1
+    for er in extra_rows:
+        rows.insert(insert_pos, er)
+        insert_pos += 1
+
+    k = InlineKeyboardMarkup(inline_keyboard=rows)
     return t, k
 
 

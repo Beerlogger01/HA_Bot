@@ -194,7 +194,10 @@ def _load_and_validate_config() -> tuple[Config, str]:
     scene = str(raw.get("goodnight_scene_id", "") or "")
 
     # -- dynamic menu options --
-    default_domains = ["light", "switch", "vacuum", "scene", "script", "climate", "fan", "cover"]
+    default_domains = [
+        "light", "switch", "vacuum", "media_player", "climate", "fan", "cover",
+        "scene", "script", "select", "number", "lock", "water_heater", "sensor",
+    ]
     domains_al = raw.get("menu_domains_allowlist", default_domains)
     if not isinstance(domains_al, list):
         domains_al = default_domains
@@ -377,7 +380,7 @@ class TelegramBot:
         user_count = len(self._config.allowed_user_ids)
         user_mode = f"{user_count} allowed user(s)" if user_count > 0 else "any user"
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
-        logger.info("Bot polling started (v2.2.0)")
+        logger.info("Bot polling started (v2.3.0)")
 
         await self._dp.start_polling(
             self._bot,

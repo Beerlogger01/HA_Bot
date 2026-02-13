@@ -463,3 +463,230 @@ async def test_export_import(db) -> None:
     assert await db.is_favorite(2, "light.test") is True
     notif = await db.get_notification(2, "sensor.temp")
     assert notif is not None
+
+
+# ---------------------------------------------------------------------------
+# Pinned items tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pinned_items_crud(db) -> None:
+    uid = 1
+
+    # Initially empty
+    items = await db.get_pinned_items(uid)
+    assert items == []
+
+    # Add area pin
+    added = await db.add_pinned_item(uid, "area", "kitchen", "Кухня")
+    assert added is True
+
+    # Duplicate
+    added = await db.add_pinned_item(uid, "area", "kitchen", "Кухня")
+    assert added is False
+
+    # Add routine pin
+    added = await db.add_pinned_item(uid, "routine", "button.vacuum_routine_1", "Floor clean")
+    assert added is True
+
+    # Get all
+    items = await db.get_pinned_items(uid)
+    assert len(items) == 2
+
+    # Get by type
+    area_pins = await db.get_pinned_items(uid, "area")
+    assert len(area_pins) == 1
+    assert area_pins[0]["target_id"] == "kitchen"
+    assert area_pins[0]["label"] == "Кухня"
+
+    # Toggle off
+    now_pinned = await db.toggle_pinned_item(uid, "area", "kitchen")
+    assert now_pinned is False
+    assert await db.is_pinned(uid, "area", "kitchen") is False
+
+    # Toggle on again
+    now_pinned = await db.toggle_pinned_item(uid, "area", "kitchen", "Кухня")
+    assert now_pinned is True
+
+    # Remove
+    removed = await db.remove_pinned_item(uid, "area", "kitchen")
+    assert removed is True
+    items = await db.get_pinned_items(uid)
+    assert len(items) == 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_items_export_import(db) -> None:
+    uid = 1
+    await db.add_pinned_item(uid, "area", "kitchen", "Кухня")
+    await db.toggle_favorite(uid, "light.test")
+
+    # Export includes pinned
+    data = await db.export_user_settings(uid)
+    assert len(data["pinned_items"]) == 1
+    assert data["pinned_items"][0]["item_type"] == "area"
+
+    # Import
+    count = await db.import_user_settings(3, data)
+    assert count >= 2  # favorite + pinned
+    items = await db.get_pinned_items(3)
+    assert len(items) == 1
+
+
+# ---------------------------------------------------------------------------
+# Device grouping tests (UI builder)
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceListBuilder:
+    def test_device_list_basic(self) -> None:
+        from ui import build_device_list
+        devices = [
+            {
+                "device_id": "abc123",
+                "name": "Kitchen Light",
+                "entity_ids": ["light.kitchen"],
+                "primary_entity_id": "light.kitchen",
+                "primary_domain": "light",
+                "is_vacuum": False,
+            },
+            {
+                "device_id": "def456",
+                "name": "Roborock S7",
+                "entity_ids": ["vacuum.s7", "sensor.s7_battery"],
+                "primary_entity_id": "vacuum.s7",
+                "primary_domain": "vacuum",
+                "is_vacuum": True,
+            },
+        ]
+        text, kb = build_device_list(devices, 0, 8, "Test", "nav:main")
+        assert "стр. 1/1" in text
+        assert len(kb.inline_keyboard) >= 3  # 2 devices + back
+
+    def test_device_list_pagination(self) -> None:
+        from ui import build_device_list
+        devices = [
+            {
+                "device_id": f"dev_{i}",
+                "name": f"Device {i}",
+                "entity_ids": [f"light.dev_{i}"],
+                "primary_entity_id": f"light.dev_{i}",
+                "primary_domain": "light",
+                "is_vacuum": False,
+            }
+            for i in range(20)
+        ]
+        text, kb = build_device_list(devices, 0, 8, "Title", "nav:main")
+        assert "стр. 1/3" in text
+
+    def test_device_list_with_pin_button(self) -> None:
+        from aiogram.types import InlineKeyboardButton
+        from ui import build_device_list
+        devices = [
+            {
+                "device_id": "abc",
+                "name": "Test",
+                "entity_ids": ["light.test"],
+                "primary_entity_id": "light.test",
+                "primary_domain": "light",
+                "is_vacuum": False,
+            },
+        ]
+        pin_btn = InlineKeyboardButton(text="Pin", callback_data="pin:area:kitchen")
+        text, kb = build_device_list(devices, 0, 8, "Title", "nav:main", pin_btn=pin_btn)
+        # Should have device + pin + back
+        assert len(kb.inline_keyboard) >= 3
+
+
+# ---------------------------------------------------------------------------
+# Media source builder tests
+# ---------------------------------------------------------------------------
+
+
+class TestMediaSourceMenu:
+    def test_basic(self) -> None:
+        from ui import build_media_source_menu
+        text, kb = build_media_source_menu(
+            "media_player.tv", "Living Room TV",
+            ["HDMI 1", "HDMI 2", "Spotify"],
+            "HDMI 1",
+        )
+        assert "Living Room TV" in text
+        assert len(kb.inline_keyboard) >= 4  # 3 sources + back
+
+    def test_empty_sources(self) -> None:
+        from ui import build_media_source_menu
+        text, kb = build_media_source_menu(
+            "media_player.tv", "TV", [], None,
+        )
+        assert "TV" in text
+        assert len(kb.inline_keyboard) >= 1  # at least back
+
+
+# ---------------------------------------------------------------------------
+# Entity control enhanced info
+# ---------------------------------------------------------------------------
+
+
+class TestEntityControlEnhanced:
+    def test_media_player_info(self) -> None:
+        from ui import build_entity_control
+        state = {
+            "state": "playing",
+            "attributes": {
+                "friendly_name": "Google Home",
+                "media_title": "My Song",
+                "source": "Spotify",
+                "volume_level": 0.5,
+                "is_volume_muted": False,
+                "source_list": ["Spotify", "YouTube"],
+            },
+        }
+        text, kb = build_entity_control("media_player.google", state)
+        assert "Google Home" in text
+        assert "Трек" in text
+        assert "Громкость: 50%" in text
+        # Should have play/pause/stop + volume + source + fav + notif + back
+        assert len(kb.inline_keyboard) >= 5
+
+    def test_sensor_read_only(self) -> None:
+        from ui import build_entity_control
+        state = {
+            "state": "22.5",
+            "attributes": {
+                "friendly_name": "Temperature",
+                "unit_of_measurement": "°C",
+            },
+        }
+        text, kb = build_entity_control("sensor.temp", state)
+        assert "Temperature" in text
+        assert "Ед. изм." in text
+
+    def test_select_control(self) -> None:
+        from ui import build_entity_control
+        state = {
+            "state": "Option A",
+            "attributes": {
+                "friendly_name": "Speed Select",
+                "options": ["Option A", "Option B", "Option C"],
+            },
+        }
+        text, kb = build_entity_control("select.speed", state)
+        assert "Speed Select" in text
+        assert "Варианты: 3" in text
+
+    def test_number_control(self) -> None:
+        from ui import build_entity_control
+        state = {
+            "state": "50",
+            "attributes": {
+                "friendly_name": "Volume Number",
+                "min": 0,
+                "max": 100,
+                "step": 5,
+            },
+        }
+        text, kb = build_entity_control("number.vol", state)
+        assert "Volume Number" in text
+        assert "Диапазон" in text

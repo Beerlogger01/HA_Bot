@@ -182,6 +182,15 @@ class Database:
                    PRIMARY KEY (user_id, entity_id)
                )"""
         )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS pinned_items (
+                   user_id   INTEGER NOT NULL,
+                   item_type TEXT    NOT NULL,
+                   target_id TEXT    NOT NULL,
+                   label     TEXT    NOT NULL DEFAULT '',
+                   PRIMARY KEY (user_id, item_type, target_id)
+               )"""
+        )
 
     async def close(self) -> None:
         if self._db is not None:
@@ -876,6 +885,85 @@ class Database:
             rows = await cur.fetchall()
         return [{"entity_id": r[0], "mute_until": r[1]} for r in rows]
 
+    # --- pinned_items (area/routine favorites) ---
+
+    async def add_pinned_item(
+        self, user_id: int, item_type: str, target_id: str, label: str = "",
+    ) -> bool:
+        """Pin an item (area, routine). Returns True if newly added."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT 1 FROM pinned_items WHERE user_id = ? AND item_type = ? AND target_id = ?",
+            (user_id, item_type, target_id),
+        ) as cur:
+            exists = (await cur.fetchone()) is not None
+        if exists:
+            return False
+        await self._db.execute(
+            "INSERT INTO pinned_items (user_id, item_type, target_id, label) VALUES (?, ?, ?, ?)",
+            (user_id, item_type, target_id, label),
+        )
+        await self._db.commit()
+        return True
+
+    async def remove_pinned_item(
+        self, user_id: int, item_type: str, target_id: str,
+    ) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "DELETE FROM pinned_items WHERE user_id = ? AND item_type = ? AND target_id = ?",
+            (user_id, item_type, target_id),
+        ) as cur:
+            deleted = cur.rowcount > 0
+        await self._db.commit()
+        return deleted
+
+    async def toggle_pinned_item(
+        self, user_id: int, item_type: str, target_id: str, label: str = "",
+    ) -> bool:
+        """Toggle pin. Returns True if now pinned."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT 1 FROM pinned_items WHERE user_id = ? AND item_type = ? AND target_id = ?",
+            (user_id, item_type, target_id),
+        ) as cur:
+            exists = (await cur.fetchone()) is not None
+        if exists:
+            await self._db.execute(
+                "DELETE FROM pinned_items WHERE user_id = ? AND item_type = ? AND target_id = ?",
+                (user_id, item_type, target_id),
+            )
+            await self._db.commit()
+            return False
+        await self._db.execute(
+            "INSERT INTO pinned_items (user_id, item_type, target_id, label) VALUES (?, ?, ?, ?)",
+            (user_id, item_type, target_id, label),
+        )
+        await self._db.commit()
+        return True
+
+    async def is_pinned(self, user_id: int, item_type: str, target_id: str) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT 1 FROM pinned_items WHERE user_id = ? AND item_type = ? AND target_id = ?",
+            (user_id, item_type, target_id),
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def get_pinned_items(
+        self, user_id: int, item_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        assert self._db is not None
+        if item_type:
+            sql = "SELECT item_type, target_id, label FROM pinned_items WHERE user_id = ? AND item_type = ? ORDER BY label"
+            params: tuple[Any, ...] = (user_id, item_type)
+        else:
+            sql = "SELECT item_type, target_id, label FROM pinned_items WHERE user_id = ? ORDER BY item_type, label"
+            params = (user_id,)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [{"item_type": r[0], "target_id": r[1], "label": r[2]} for r in rows]
+
     # --- export/import helpers ---
 
     async def export_user_settings(self, user_id: int) -> dict[str, Any]:
@@ -885,12 +973,14 @@ class Database:
         notifs = await self.get_user_notifications(user_id)
         role = await self.get_user_role(user_id)
         schedules = await self.get_schedules(user_id)
+        pinned = await self.get_pinned_items(user_id)
         return {
             "user_id": user_id,
             "role": role,
             "favorites": favorites,
             "favorite_actions": fav_actions,
             "notifications": notifs,
+            "pinned_items": pinned,
             "schedules": [
                 {"name": s["name"], "action_type": s["action_type"],
                  "payload": s["payload"], "cron_expr": s["cron_expr"],
@@ -927,6 +1017,15 @@ class Database:
                         "VALUES (?, ?, 1, ?, 60, 0)",
                         (user_id, eid, mode),
                     )
+                    count += 1
+
+        # Pinned items
+        for pin in data.get("pinned_items", []):
+            itype = pin.get("item_type", "")
+            tid = pin.get("target_id", "")
+            if itype and tid:
+                added = await self.add_pinned_item(user_id, itype, tid, pin.get("label", ""))
+                if added:
                     count += 1
 
         await self._db.commit()

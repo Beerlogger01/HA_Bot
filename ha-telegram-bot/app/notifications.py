@@ -35,7 +35,7 @@ HA_WS_URL = "ws://supervisor/core/websocket"
 _KEY_ATTRS: dict[str, frozenset[str]] = {
     "vacuum": frozenset({"status", "battery_level", "error", "fan_speed"}),
     "climate": frozenset({"current_temperature", "temperature", "hvac_action"}),
-    "media_player": frozenset({"media_title", "source"}),
+    "media_player": frozenset({"media_title", "source", "volume_level"}),
 }
 
 # Actionable buttons per domain for notification messages
@@ -58,6 +58,15 @@ _NOTIF_ACTIONS: dict[str, list[tuple[str, str, str]]] = {
         ("\u2b06 Open", "nact", "open_cover"),
         ("\u23f9 Stop", "nact", "stop_cover"),
         ("\u2b07 Close", "nact", "close_cover"),
+    ],
+    "media_player": [
+        ("\u25b6 Play", "nact", "media_play"),
+        ("\u23f8 Pause", "nact", "media_pause"),
+        ("\u23f9 Stop", "nact", "media_stop"),
+    ],
+    "lock": [
+        ("\U0001f513 Unlock", "nact", "unlock"),
+        ("\U0001f512 Lock", "nact", "lock"),
     ],
 }
 
@@ -256,8 +265,19 @@ class NotificationManager:
             # Build notification text
             friendly = new_state.get("attributes", {}).get("friendly_name", entity_id)
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+            # Vacuum completion / error detection
+            domain = entity_id.split(".", 1)[0]
+            completion_line = ""
+            if domain == "vacuum" and old_val in ("cleaning", "returning") and new_val in ("docked", "idle"):
+                completion_line = "\u2705 Уборка завершена!\n"
+            elif domain == "vacuum" and new_val == "error":
+                error_msg = new_state.get("attributes", {}).get("error", "")
+                completion_line = f"\u274c Ошибка: {_sanitize(str(error_msg)[:100])}\n" if error_msg else "\u274c Ошибка!\n"
+
             text = (
                 f"\U0001f514 <b>{_sanitize(friendly)}</b>\n"
+                f"{completion_line}"
                 f"{_sanitize(old_val)} \u2192 {_sanitize(new_val)}\n"
                 f"<i>{ts} UTC</i>"
             )

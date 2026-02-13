@@ -29,6 +29,7 @@ from storage import Database
 from ui import (
     build_areas_menu,
     build_confirmation,
+    build_device_list,
     build_diagnostics_menu,
     build_entity_control,
     build_entity_list,
@@ -37,6 +38,7 @@ from ui import (
     build_floors_menu,
     build_help_menu,
     build_main_menu,
+    build_media_source_menu,
     build_notif_list,
     build_roles_list,
     build_schedule_list,
@@ -59,6 +61,10 @@ _ALLOWED_SERVICES: frozenset[str] = frozenset({
     "lock", "unlock",
     "press",
     "media_play", "media_pause", "media_stop",
+    "volume_up", "volume_down", "volume_mute", "volume_set",
+    "select_source",
+    "select_option",
+    "set_value",
     "set_temperature",
 })
 
@@ -71,6 +77,7 @@ _ROLE_LEVELS: dict[str, int] = {"admin": 3, "user": 2, "guest": 1}
 _WRITE_PREFIXES: frozenset[str] = frozenset({
     "act", "bright", "clim", "fav", "ntog", "vseg", "vcmd", "rtn",
     "nact", "nmute", "fa_run", "fa_del", "schtog", "schdel", "snapdel",
+    "mvol", "mmut", "msrs", "ssel", "nval", "pin",
 })
 
 
@@ -629,6 +636,10 @@ class Handlers:
             await self._send_or_edit(cid, t, k, menu="schedule")
         elif target == "refresh":
             await self._do_refresh(cid)
+        elif target == "diag":
+            diag_text = await self._diag.get_diagnostics_text()
+            t, k = build_diagnostics_menu(diag_text)
+            await self._send_or_edit(cid, t, k, menu="diag")
         elif target == "status":
             ents = await self._fetch_status_entities()
             t, k = build_status_menu(ents)
@@ -679,7 +690,7 @@ class Handlers:
         await self._send_or_edit(cid, t, k, menu=f"floor:{floor_id}")
 
     # -----------------------------------------------------------------------
-    # ar: — area selected -> entity list
+    # ar: — area selected -> device list (grouped by device_id)
     # -----------------------------------------------------------------------
 
     async def _area(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
@@ -688,23 +699,39 @@ class Handlers:
 
         domains = frozenset(self._cfg.menu_domains_allowlist)
         if area_id == "__none__":
-            eids = self._reg.get_unassigned_entities(domains)
+            devices = self._reg.get_unassigned_devices(domains)
             title = "\U0001f4e6 <b>Без комнаты</b>"
         else:
-            eids = self._reg.get_area_entities(area_id, domains)
+            devices = self._reg.get_devices_for_area(area_id, domains)
             area = self._reg.areas.get(area_id)
             title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
 
-        ent_list = await self._enrich_entities(eids)
-        t, k = build_entity_list(
-            ent_list, 0, self._cfg.menu_page_size,
+        if not devices:
+            t, k = build_confirmation(f"{title}\n\nНет устройств.", "nav:manage")
+            await self._send_or_edit(cid, t, k, menu=f"area:{area_id}")
+            return
+
+        # If there's only one device with one entity, go straight to entity control
+        if len(devices) == 1 and len(devices[0]["entity_ids"]) == 1:
+            await self._show_entity_control(cid, uid, devices[0]["primary_entity_id"])
+            return
+
+        pin_btn = None
+        if area_id and area_id != "__none__":
+            is_pinned = await self._db.is_pinned(uid, "area", area_id)
+            pin_label = "\U0001f4cc Убрать" if is_pinned else "\U0001f4cc Закрепить"
+            pin_btn = InlineKeyboardButton(text=pin_label, callback_data=f"pin:area:{area_id}")
+
+        t, k = build_device_list(
+            devices, 0, self._cfg.menu_page_size,
             title=title, back_cb="nav:manage",
             page_cb_prefix=f"arp:{area_id}",
+            pin_btn=pin_btn,
         )
         await self._send_or_edit(cid, t, k, menu=f"area:{area_id}")
 
     # -----------------------------------------------------------------------
-    # arp: — area entity pagination
+    # arp: — area device pagination
     # -----------------------------------------------------------------------
 
     async def _area_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
@@ -722,18 +749,24 @@ class Handlers:
 
         domains = frozenset(self._cfg.menu_domains_allowlist)
         if area_id == "__none__":
-            eids = self._reg.get_unassigned_entities(domains)
+            devices = self._reg.get_unassigned_devices(domains)
             title = "\U0001f4e6 <b>Без комнаты</b>"
         else:
-            eids = self._reg.get_area_entities(area_id, domains)
+            devices = self._reg.get_devices_for_area(area_id, domains)
             area = self._reg.areas.get(area_id)
             title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
 
-        ent_list = await self._enrich_entities(eids)
-        t, k = build_entity_list(
-            ent_list, page, self._cfg.menu_page_size,
+        pin_btn = None
+        if area_id and area_id != "__none__":
+            is_pinned = await self._db.is_pinned(uid, "area", area_id)
+            pin_label = "\U0001f4cc Убрать" if is_pinned else "\U0001f4cc Закрепить"
+            pin_btn = InlineKeyboardButton(text=pin_label, callback_data=f"pin:area:{area_id}")
+
+        t, k = build_device_list(
+            devices, page, self._cfg.menu_page_size,
             title=title, back_cb="nav:manage",
             page_cb_prefix=f"arp:{area_id}",
+            pin_btn=pin_btn,
         )
         await self._send_or_edit(cid, t, k, menu=f"area:{area_id}:{page}")
 
@@ -748,6 +781,88 @@ class Handlers:
             return
         await cb.answer()
         await self._show_entity_control(cid, uid, eid)
+
+    # -----------------------------------------------------------------------
+    # dev: — device selected -> show entities or entity control
+    # -----------------------------------------------------------------------
+
+    async def _device(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        device_id = data.split(":", 1)[1] if ":" in data else ""
+        if not device_id:
+            await cb.answer()
+            return
+        await cb.answer()
+
+        domains = frozenset(self._cfg.menu_domains_allowlist)
+
+        # Check if it's a vacuum device → go to vacuum entity control
+        vac_eid = self._reg.get_vacuum_entity_for_device(device_id)
+        if vac_eid:
+            await self._show_entity_control(cid, uid, vac_eid)
+            return
+
+        # Get entities for this device
+        eids = self._reg.get_device_entity_ids(device_id, domains)
+
+        # If device_id is actually an entity_id (virtual device), show control directly
+        if not eids and "." in device_id:
+            await self._show_entity_control(cid, uid, device_id)
+            return
+
+        # Single entity → direct control
+        if len(eids) == 1:
+            await self._show_entity_control(cid, uid, eids[0])
+            return
+
+        # Multiple entities → show entity list
+        ent_list = await self._enrich_entities(eids)
+        dev = self._reg.devices.get(device_id)
+        dev_name = dev.name if dev else device_id
+
+        # Find area_id for back navigation
+        area_id = dev.area_id if dev else None
+        back_cb = f"ar:{area_id}" if area_id else "nav:manage"
+
+        t, k = build_entity_list(
+            ent_list, 0, self._cfg.menu_page_size,
+            title=f"\U0001f4e6 <b>{dev_name}</b>",
+            back_cb=back_cb,
+            page_cb_prefix=f"dvp:{device_id}",
+        )
+        await self._send_or_edit(cid, t, k, menu=f"device:{device_id}")
+
+    # -----------------------------------------------------------------------
+    # dvp: — device entity pagination
+    # -----------------------------------------------------------------------
+
+    async def _device_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        device_id = parts[1]
+        try:
+            page = int(parts[2])
+        except ValueError:
+            page = 0
+        await cb.answer()
+
+        domains = frozenset(self._cfg.menu_domains_allowlist)
+        eids = self._reg.get_device_entity_ids(device_id, domains)
+        ent_list = await self._enrich_entities(eids)
+
+        dev = self._reg.devices.get(device_id)
+        dev_name = dev.name if dev else device_id
+        area_id = dev.area_id if dev else None
+        back_cb = f"ar:{area_id}" if area_id else "nav:manage"
+
+        t, k = build_entity_list(
+            ent_list, page, self._cfg.menu_page_size,
+            title=f"\U0001f4e6 <b>{dev_name}</b>",
+            back_cb=back_cb,
+            page_cb_prefix=f"dvp:{device_id}",
+        )
+        await self._send_or_edit(cid, t, k, menu=f"device:{device_id}:{page}")
 
     async def _show_entity_control(self, cid: int, uid: int, eid: str) -> None:
         state = await self._ha.get_state(eid)
@@ -891,6 +1006,227 @@ class Handlers:
                      success=ok, error=err if not ok else None)
         if ok:
             await self._show_entity_control(cid, uid, eid)
+
+    # -----------------------------------------------------------------------
+    # mvol: — media player volume
+    # -----------------------------------------------------------------------
+
+    async def _media_vol(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        eid, direction = parts[1], parts[2]
+        if not await self._check_rl(uid, "media_player.volume", cb):
+            return
+
+        await cb.answer("\U0001f50a Громкость...")
+        service = "volume_up" if direction == "up" else "volume_down"
+        ok, err = await self._ha.call_service("media_player", service, {"entity_id": eid})
+        if ok:
+            self._rl.record()
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action=f"media_player.{service}", entity_id=eid,
+                     success=ok, error=err if not ok else None)
+        if ok:
+            await self._show_entity_control(cid, uid, eid)
+
+    # -----------------------------------------------------------------------
+    # mmut: — media player mute toggle
+    # -----------------------------------------------------------------------
+
+    async def _media_mute(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        eid = data.split(":", 1)[1] if ":" in data else ""
+        if not eid:
+            await cb.answer()
+            return
+        if not await self._check_rl(uid, "media_player.volume_mute", cb):
+            return
+
+        state = await self._ha.get_state(eid)
+        is_muted = state.get("attributes", {}).get("is_volume_muted", False) if state else False
+
+        await cb.answer("\U0001f507 Mute...")
+        ok, err = await self._ha.call_service(
+            "media_player", "volume_mute",
+            {"entity_id": eid, "is_volume_muted": not is_muted},
+        )
+        if ok:
+            self._rl.record()
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action="media_player.volume_mute", entity_id=eid,
+                     success=ok, error=err if not ok else None)
+        if ok:
+            await self._show_entity_control(cid, uid, eid)
+
+    # -----------------------------------------------------------------------
+    # msrc: — media player source menu
+    # -----------------------------------------------------------------------
+
+    async def _media_source(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        eid = data.split(":", 1)[1] if ":" in data else ""
+        if not eid:
+            await cb.answer()
+            return
+        await cb.answer()
+
+        state = await self._ha.get_state(eid)
+        if not state:
+            t, k = build_confirmation("\U0001f534 Не удалось получить состояние.", f"ent:{eid}")
+            await self._send_or_edit(cid, t, k, menu="media_src_err")
+            return
+
+        attrs = state.get("attributes", {})
+        name = attrs.get("friendly_name", eid)
+        sources = attrs.get("source_list", [])
+        current = attrs.get("source")
+
+        t, k = build_media_source_menu(eid, name, sources, current)
+        await self._send_or_edit(cid, t, k, menu="media_src", entity=eid)
+
+    # -----------------------------------------------------------------------
+    # msrs: — media player select source
+    # -----------------------------------------------------------------------
+
+    async def _media_source_sel(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        eid, source = parts[1], parts[2]
+        if not await self._check_rl(uid, "media_player.select_source", cb):
+            return
+
+        await cb.answer("\U0001f4fb Выбираю источник...")
+        ok, err = await self._ha.call_service(
+            "media_player", "select_source",
+            {"entity_id": eid, "source": source},
+        )
+        if ok:
+            self._rl.record()
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action="media_player.select_source", entity_id=eid,
+                     success=ok, error=err if not ok else None)
+        if ok:
+            await self._show_entity_control(cid, uid, eid)
+        else:
+            await cb.answer(f"Ошибка: {(err or '')[:180]}", show_alert=True)
+
+    # -----------------------------------------------------------------------
+    # ssel: — select entity option
+    # -----------------------------------------------------------------------
+
+    async def _select_option(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        eid, option = parts[1], parts[2]
+        if not await self._check_rl(uid, "select.select_option", cb):
+            return
+
+        await cb.answer("\u2699\ufe0f Выбираю...")
+        ok, err = await self._ha.call_service(
+            "select", "select_option",
+            {"entity_id": eid, "option": option},
+        )
+        if ok:
+            self._rl.record()
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action="select.select_option", entity_id=eid,
+                     success=ok, error=err if not ok else None)
+        if ok:
+            await self._show_entity_control(cid, uid, eid)
+
+    # -----------------------------------------------------------------------
+    # nval: — number entity value adjustment
+    # -----------------------------------------------------------------------
+
+    async def _number_val(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        eid, direction = parts[1], parts[2]
+        if not await self._check_rl(uid, "number.set_value", cb):
+            return
+
+        state = await self._ha.get_state(eid)
+        attrs = state.get("attributes", {}) if state else {}
+        try:
+            current = float(state.get("state", 0) if state else 0)
+        except (TypeError, ValueError):
+            current = 0.0
+
+        step = float(attrs.get("step", 1))
+        mn = float(attrs.get("min", 0))
+        mx = float(attrs.get("max", 100))
+
+        new_val = current + step if direction == "up" else current - step
+        new_val = max(mn, min(mx, new_val))
+
+        await cb.answer(f"Значение: {new_val}")
+        ok, err = await self._ha.call_service(
+            "number", "set_value",
+            {"entity_id": eid, "value": new_val},
+        )
+        if ok:
+            self._rl.record()
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action="number.set_value", entity_id=eid,
+                     success=ok, error=err if not ok else None)
+        if ok:
+            await self._show_entity_control(cid, uid, eid)
+
+    # -----------------------------------------------------------------------
+    # pin: — toggle pinned item (area/routine)
+    # -----------------------------------------------------------------------
+
+    async def _pin_toggle(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        # pin:item_type:target_id
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        item_type, target_id = parts[1], parts[2]
+
+        # Resolve label
+        label = target_id
+        if item_type == "area":
+            area = self._reg.areas.get(target_id)
+            if area:
+                label = area.name
+        elif item_type == "routine":
+            state = await self._ha.get_state(target_id)
+            if state:
+                label = state.get("attributes", {}).get("friendly_name", target_id)
+
+        now_pinned = await self._db.toggle_pinned_item(uid, item_type, target_id, label)
+        msg = "Закреплено" if now_pinned else "Откреплено"
+        await cb.answer(f"\U0001f4cc {msg}")
+
+        # Refresh the current view
+        menu_state = await self._db.get_menu_state(cid)
+        current_menu = menu_state.get("current_menu", "") if menu_state else ""
+        if current_menu.startswith("area:"):
+            area_id = current_menu.split(":", 1)[1].split(":", 1)[0]
+            # Re-render the area page
+            domains = frozenset(self._cfg.menu_domains_allowlist)
+            devices = self._reg.get_devices_for_area(area_id, domains)
+            area = self._reg.areas.get(area_id)
+            title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
+            is_pinned = await self._db.is_pinned(uid, "area", area_id)
+            pin_label = "\U0001f4cc Убрать" if is_pinned else "\U0001f4cc Закрепить"
+            pin_btn = InlineKeyboardButton(text=pin_label, callback_data=f"pin:area:{area_id}")
+            t, k = build_device_list(
+                devices, 0, self._cfg.menu_page_size,
+                title=title, back_cb="nav:manage",
+                page_cb_prefix=f"arp:{area_id}",
+                pin_btn=pin_btn,
+            )
+            await self._send_or_edit(cid, t, k, menu=f"area:{area_id}")
+        elif current_menu == "favorites":
+            await self._show_favorites(cid, uid, 0)
 
     # -----------------------------------------------------------------------
     # fav: — toggle favorite
@@ -1453,7 +1789,8 @@ class Handlers:
         fav_eids = await self._db.get_favorites(uid)
         ent_list = await self._enrich_entities(fav_eids)
         fav_actions = await self._db.get_favorite_actions(uid)
-        t, k = build_favorites_menu(ent_list, page, self._cfg.menu_page_size, fav_actions)
+        pinned = await self._db.get_pinned_items(uid)
+        t, k = build_favorites_menu(ent_list, page, self._cfg.menu_page_size, fav_actions, pinned)
         await self._send_or_edit(cid, t, k, menu="favorites")
 
     async def _show_fav_actions(self, cid: int, uid: int, page: int) -> None:
@@ -1569,9 +1906,18 @@ class Handlers:
         "ar": _area,
         "arp": _area_page,
         "ent": _entity,
+        "dev": _device,
+        "dvp": _device_page,
         "act": _action,
         "bright": _brightness,
         "clim": _climate,
+        "mvol": _media_vol,
+        "mmut": _media_mute,
+        "msrc": _media_source,
+        "msrs": _media_source_sel,
+        "ssel": _select_option,
+        "nval": _number_val,
+        "pin": _pin_toggle,
         "fav": _fav_toggle,
         "ntog": _notif_toggle,
         "favp": _fav_page,
