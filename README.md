@@ -458,7 +458,40 @@ Check logs for HTTP error codes:
 - **404**: Entity doesn't exist - check entity ID spelling
 - **401**: Authorization issue (rare with Supervisor proxy)
 - **500**: Home Assistant internal error - check HA logs
+- **502**: HA Core is booting or restarting - see below
 - **Timeout**: HA is slow or restarting - the bot retries automatically
+
+### 502 errors at startup
+
+This is **normal** when the add-on starts before HA Core has finished booting (common after a full system restart or HA update). The bot now handles this automatically:
+
+1. **Readiness gating**: On startup the bot tries to reach HA up to 10 times with exponential backoff (3s, 6s, 12s, ..., up to 30s between attempts).
+2. **Degraded mode**: If HA is still not reachable, the bot starts Telegram polling anyway. Menus will work but show empty data until HA becomes available.
+3. **Auto-recovery**: A background task checks HA every 30 seconds. When HA becomes available, the bot automatically syncs the registry and restores full functionality.
+4. **Periodic re-sync**: Even after recovery, the registry is refreshed every 5 minutes to pick up entity/device changes.
+
+You'll see these log messages during the process:
+```
+[WARNING] HA not ready (attempt 1/10), retrying in 3s...
+[WARNING] HA not reachable after 10 attempts — starting in degraded mode
+[INFO] Bot polling started (v2.3.2, mode=degraded)
+...
+[INFO] HA API recovered — version 2024.x.x
+[INFO] Registry sync complete: N floors, N areas, N devices, N entities
+[INFO] Recovery complete — full functionality restored
+```
+
+No user action is required — the bot recovers on its own.
+
+## Manual Verification Checklist
+
+Use this checklist to verify resilient startup behavior after installation or upgrade:
+
+- [ ] **Normal startup**: Start the add-on when HA Core is already running. Logs should show `HA API self-test passed` followed by `Registry sync complete` and `Bot polling started (v2.3.2, mode=full)`.
+- [ ] **Start during HA boot**: Restart Home Assistant (Settings > System > Restart) and immediately start the add-on. Logs should show `HA not ready (attempt N/10)` messages, then either recovery or degraded mode.
+- [ ] **Degraded mode**: Stop HA Core, start the add-on. Confirm it shows `mode=degraded` in the startup log. Send `/start` to the bot — it should respond with the main menu (menus will show no devices until HA recovers).
+- [ ] **Auto-recovery**: With the bot running in degraded mode, start HA Core. Within 30 seconds, logs should show `HA API recovered` and `Recovery complete — full functionality restored`. Bot menus should now show devices.
+- [ ] **Notifications reconnect**: After recovery, verify that the notification WebSocket reconnects (look for `Notification WS subscribed to state_changed` in logs). Toggle a subscribed entity and confirm notifications arrive.
 
 ## Persistence
 

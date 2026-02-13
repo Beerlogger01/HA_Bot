@@ -1,5 +1,5 @@
 name: "Home Assistant Telegram Bot"
-version: "2.3.1"
+version: "2.3.2"
 slug: ha_telegram_bot
 description: "Interactive Telegram bot with dynamic HA mirroring (floors/areas/devices), vacuum room targeting, Roborock routines, media player controls, full domain support, favorites with pinned items, notifications with completion events, search, snapshots, scheduler, diagnostics, role-based access control, and dynamic device discovery for Home Assistant"
 image: "ghcr.io/beerlogger01/ha-bot-ha-telegram-bot-{arch}"

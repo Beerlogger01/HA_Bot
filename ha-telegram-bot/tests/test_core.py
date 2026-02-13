@@ -831,3 +831,147 @@ class TestMainMenuActiveButton:
                     assert btn.callback_data == "menu:active"
                     found = True
         assert found, "Active Now button not found in main menu"
+
+
+# ---------------------------------------------------------------------------
+# Readiness gating & recovery tests
+# ---------------------------------------------------------------------------
+
+
+class TestReadinessGating:
+    @pytest.mark.asyncio
+    async def test_wait_for_ha_success_first_try(self) -> None:
+        """If HA responds immediately, _wait_for_ha returns version."""
+        import app as app_mod
+
+        # Save originals
+        orig_max = app_mod._READINESS_MAX_ATTEMPTS
+        orig_delay = app_mod._READINESS_BASE_DELAY
+        try:
+            app_mod._READINESS_MAX_ATTEMPTS = 3
+            app_mod._READINESS_BASE_DELAY = 0.01
+
+            bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+            bot._ha = MagicMock()
+            bot._ha.get_config = AsyncMock(return_value={"version": "2024.1.0"})
+
+            version = await bot._wait_for_ha()
+            assert version == "2024.1.0"
+            assert bot._ha.get_config.call_count == 1
+        finally:
+            app_mod._READINESS_MAX_ATTEMPTS = orig_max
+            app_mod._READINESS_BASE_DELAY = orig_delay
+
+    @pytest.mark.asyncio
+    async def test_wait_for_ha_retries_then_succeeds(self) -> None:
+        """HA fails twice then succeeds on third attempt."""
+        import app as app_mod
+
+        orig_max = app_mod._READINESS_MAX_ATTEMPTS
+        orig_delay = app_mod._READINESS_BASE_DELAY
+        try:
+            app_mod._READINESS_MAX_ATTEMPTS = 5
+            app_mod._READINESS_BASE_DELAY = 0.01
+
+            bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+            bot._ha = MagicMock()
+            bot._ha.get_config = AsyncMock(
+                side_effect=[None, None, {"version": "2024.2.0"}]
+            )
+
+            version = await bot._wait_for_ha()
+            assert version == "2024.2.0"
+            assert bot._ha.get_config.call_count == 3
+        finally:
+            app_mod._READINESS_MAX_ATTEMPTS = orig_max
+            app_mod._READINESS_BASE_DELAY = orig_delay
+
+    @pytest.mark.asyncio
+    async def test_wait_for_ha_all_fail(self) -> None:
+        """All attempts fail — returns empty string."""
+        import app as app_mod
+
+        orig_max = app_mod._READINESS_MAX_ATTEMPTS
+        orig_delay = app_mod._READINESS_BASE_DELAY
+        try:
+            app_mod._READINESS_MAX_ATTEMPTS = 3
+            app_mod._READINESS_BASE_DELAY = 0.01
+
+            bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+            bot._ha = MagicMock()
+            bot._ha.get_config = AsyncMock(return_value=None)
+
+            version = await bot._wait_for_ha()
+            assert version == ""
+            assert bot._ha.get_config.call_count == 3
+        finally:
+            app_mod._READINESS_MAX_ATTEMPTS = orig_max
+            app_mod._READINESS_BASE_DELAY = orig_delay
+
+    @pytest.mark.asyncio
+    async def test_do_registry_sync_success(self) -> None:
+        """_do_registry_sync returns True when sync succeeds."""
+        import app as app_mod
+
+        bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+        bot._registry = MagicMock()
+        bot._registry.sync = AsyncMock(return_value=True)
+        bot._registry.floors = {"f1": None}
+        bot._registry.areas = {"a1": None}
+        bot._registry.devices = {"d1": None}
+        bot._registry.entities = {"e1": None}
+        bot._registry.vacuum_routines = {}
+
+        result = await bot._do_registry_sync()
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_do_registry_sync_failure(self) -> None:
+        """_do_registry_sync returns False when sync fails."""
+        import app as app_mod
+
+        bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+        bot._registry = MagicMock()
+        bot._registry.sync = AsyncMock(return_value=False)
+
+        result = await bot._do_registry_sync()
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_recovery_loop_recovers(self) -> None:
+        """Recovery loop detects HA coming back and re-syncs."""
+        import app as app_mod
+
+        orig_interval = app_mod._RECOVERY_INTERVAL
+        try:
+            app_mod._RECOVERY_INTERVAL = 0.01
+
+            bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+            bot._ha_ready = False
+            bot._ha = MagicMock()
+            bot._ha.get_config = AsyncMock(return_value={"version": "2024.3.0"})
+            bot._handlers = MagicMock()
+            bot._diagnostics = MagicMock()
+            bot._registry = MagicMock()
+            bot._registry.sync = AsyncMock(return_value=True)
+            bot._registry.floors = {}
+            bot._registry.areas = {}
+            bot._registry.devices = {}
+            bot._registry.entities = {}
+            bot._registry.vacuum_routines = {}
+
+            # Run one iteration of recovery
+            task = asyncio.create_task(bot._recovery_loop())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+            assert bot._ha_ready is True
+            assert bot._handlers.ha_version == "2024.3.0"
+            assert bot._diagnostics.ha_version == "2024.3.0"
+            bot._registry.sync.assert_called()
+        finally:
+            app_mod._RECOVERY_INTERVAL = orig_interval

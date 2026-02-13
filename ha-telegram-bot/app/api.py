@@ -95,7 +95,11 @@ class HAClient:
                 )
 
             if attempt < MAX_RETRIES:
-                delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                # Longer backoff for 502/503 (HA booting) vs other transient errors
+                if "HTTP 502" in last_error or "HTTP 503" in last_error:
+                    delay = RETRY_BACKOFF_BASE * 2 * (2 ** (attempt - 1))
+                else:
+                    delay = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
                 await asyncio.sleep(delay)
 
         logger.error(

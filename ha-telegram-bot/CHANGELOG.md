@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.3.2
+
+- **Resilient startup** — readiness gating with exponential backoff waits for HA Core to become available (handles 502 during boot)
+- **Degraded mode** — bot starts Telegram polling even when HA is unreachable; menus work but show empty data
+- **Auto-recovery** — background task detects when HA becomes available, re-syncs registry, and restores full functionality
+- **Periodic re-sync** — registry is refreshed every 5 minutes to pick up entity/device changes after HA restarts
+- Longer backoff for 502/503 errors in HA API client
+- Recovery task cleanly cancelled on shutdown
+- Version bump to 2.3.2
+
 ## 2.3.1
 
 - **Active Now** button on main menu — shows all entities currently on/active (lights, media players, vacuums, etc.)

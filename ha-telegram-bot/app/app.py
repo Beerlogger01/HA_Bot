@@ -260,6 +260,12 @@ def _load_and_validate_config() -> tuple[Config, str]:
 # ---------------------------------------------------------------------------
 
 
+_READINESS_MAX_ATTEMPTS = 10
+_READINESS_BASE_DELAY: float = 3.0
+_RECOVERY_INTERVAL = 30     # seconds between checks in degraded mode
+_RESYNC_INTERVAL = 300      # seconds between periodic re-syncs
+
+
 class TelegramBot:
     def __init__(self, config: Config, supervisor_token: str) -> None:
         self._config = config
@@ -285,21 +291,34 @@ class TelegramBot:
         self._diagnostics: Diagnostics | None = None
         self._error_capture: ErrorCapture | None = None
         self._handlers: Handlers | None = None
+        self._ha_ready = False
+        self._recovery_task: asyncio.Task[None] | None = None
 
-    async def run(self) -> None:
-        await self._db.open()
-        await self._ha.open()
+    # -------------------------------------------------------------------
+    # Startup helpers
+    # -------------------------------------------------------------------
 
-        # Self-test
-        ha_cfg = await self._ha.get_config()
-        ha_version = "unknown"
-        if ha_cfg:
-            ha_version = ha_cfg.get("version", "unknown")
-            logger.info("HA API self-test passed — version %s", ha_version)
-        else:
-            logger.error("HA API self-test FAILED — check SUPERVISOR_TOKEN / network")
+    async def _wait_for_ha(self) -> str:
+        """Try to reach HA Core with exponential backoff.
 
-        # Registry sync
+        Returns HA version string on success, empty string on failure.
+        """
+        delay = _READINESS_BASE_DELAY
+        for attempt in range(1, _READINESS_MAX_ATTEMPTS + 1):
+            ha_cfg = await self._ha.get_config()
+            if ha_cfg:
+                return ha_cfg.get("version", "unknown")
+            if attempt < _READINESS_MAX_ATTEMPTS:
+                logger.warning(
+                    "HA not ready (attempt %d/%d), retrying in %.0fs...",
+                    attempt, _READINESS_MAX_ATTEMPTS, delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+        return ""
+
+    async def _do_registry_sync(self) -> bool:
+        """Perform registry sync and log results."""
         logger.info("Starting registry sync...")
         sync_ok = await self._registry.sync()
         if sync_ok:
@@ -314,8 +333,62 @@ class TelegramBot:
                 logger.info("Vacuum %s: %d routines", vac_eid, len(btns))
         else:
             logger.warning("Registry sync failed — bot will work with limited navigation")
+        return sync_ok
 
-        # Diagnostics
+    async def _recovery_loop(self) -> None:
+        """Background: recover from HA outages and periodic re-sync."""
+        while True:
+            try:
+                if not self._ha_ready:
+                    await asyncio.sleep(_RECOVERY_INTERVAL)
+                    ha_cfg = await self._ha.get_config()
+                    if ha_cfg:
+                        version = ha_cfg.get("version", "unknown")
+                        logger.info("HA API recovered — version %s", version)
+                        self._ha_ready = True
+                        if self._handlers:
+                            self._handlers.ha_version = version
+                        if self._diagnostics:
+                            self._diagnostics.ha_version = version
+                        await self._do_registry_sync()
+                        logger.info("Recovery complete — full functionality restored")
+                else:
+                    await asyncio.sleep(_RESYNC_INTERVAL)
+                    ha_cfg = await self._ha.get_config()
+                    if not ha_cfg:
+                        logger.warning("HA API connection lost — entering degraded mode")
+                        self._ha_ready = False
+                    else:
+                        # Periodic re-sync for entity/device changes
+                        await self._registry.sync()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Recovery loop error")
+                await asyncio.sleep(_RECOVERY_INTERVAL)
+
+    # -------------------------------------------------------------------
+    # Main run
+    # -------------------------------------------------------------------
+
+    async def run(self) -> None:
+        await self._db.open()
+        await self._ha.open()
+
+        # Readiness gating — wait for HA with exponential backoff
+        ha_version = await self._wait_for_ha()
+        if ha_version:
+            self._ha_ready = True
+            logger.info("HA API self-test passed — version %s", ha_version)
+            await self._do_registry_sync()
+        else:
+            ha_version = "unknown"
+            logger.warning(
+                "HA not reachable after %d attempts — starting in degraded mode",
+                _READINESS_MAX_ATTEMPTS,
+            )
+
+        # Diagnostics (works in degraded mode with "unknown" version)
         self._diagnostics = Diagnostics(
             ha=self._ha, db=self._db, registry=self._registry,
             ha_version=ha_version,
@@ -364,6 +437,11 @@ class TelegramBot:
         await self._notif.start()
         await self._scheduler.start()
 
+        # Start recovery / periodic re-sync task
+        self._recovery_task = asyncio.create_task(
+            self._recovery_loop(), name="ha_recovery",
+        )
+
         # Bot identity
         try:
             me = await self._bot.get_me()
@@ -380,7 +458,9 @@ class TelegramBot:
         user_count = len(self._config.allowed_user_ids)
         user_mode = f"{user_count} allowed user(s)" if user_count > 0 else "any user"
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
-        logger.info("Bot polling started (v2.3.1)")
+
+        mode_label = "degraded" if not self._ha_ready else "full"
+        logger.info("Bot polling started (v2.3.2, mode=%s)", mode_label)
 
         await self._dp.start_polling(
             self._bot,
@@ -389,6 +469,14 @@ class TelegramBot:
 
     async def shutdown(self) -> None:
         errors: list[str] = []
+
+        # Cancel recovery task
+        if self._recovery_task and not self._recovery_task.done():
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
 
         # Remove error capture handler
         if self._error_capture is not None:
