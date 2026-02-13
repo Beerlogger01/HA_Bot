@@ -1,5 +1,5 @@
 name: "Home Assistant Telegram Bot"
-version: "2.3.3"
+version: "2.3.4"
 slug: ha_telegram_bot
 description: "Interactive Telegram bot with dynamic HA mirroring (floors/areas/devices), vacuum room targeting, Roborock routines, media player controls, full domain support, favorites with pinned items, notifications with completion events, search, snapshots, scheduler, diagnostics, role-based access control, and dynamic device discovery for Home Assistant"
 image: "ghcr.io/beerlogger01/ha-bot-ha-telegram-bot-{arch}"
@@ -20,6 +20,10 @@ options:
   allowed_chat_id: 0
   allowed_user_ids: []
   cooldown_seconds: 2
+  cooldown_seconds_default: 2.0
+  cooldown_overrides:
+    light.brightness: 0.2
+    media_player.volume: 0.2
   global_rate_limit_actions: 10
   global_rate_limit_window: 5
   status_entities: []
@@ -63,7 +67,11 @@ schema:
   allowed_chat_id: int?
   allowed_user_ids:
     - int?
-  cooldown_seconds: int(1,60)
+  cooldown_seconds: int(1,60)?
+  cooldown_seconds_default: float?
+  cooldown_overrides:
+    light.brightness: float?
+    media_player.volume: float?
   global_rate_limit_actions: int(1,100)
   global_rate_limit_window: int(1,60)
   status_entities:

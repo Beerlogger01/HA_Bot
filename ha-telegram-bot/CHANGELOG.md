@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.3.4
+
+- **Per-action rate limit overrides** — `cooldown_seconds_default` (float) + `cooldown_overrides` dict for fine-grained control; defaults 0.2s for brightness/volume, backward-compatible with old `cooldown_seconds`
+- **Brightness/volume debounce** — rapid taps coalesce into a single HA service call (0.25s window); light uses absolute brightness, volume uses `volume_set` with numeric level
+- **Callback race protection** — per-user `asyncio.Lock` serializes callback handling; idempotency guard rejects duplicate callbacks within 0.25s (exempts debounce controls)
+- **HA readiness gating improved** — `_wait_for_ha` now requires both `get_config()` AND `registry.sync()` success before declaring ready; keeps degraded mode fallback
+- **SYNC diff summary** — refresh button shows contextual diff (added/removed areas, devices, entities) alongside counts
+- Version bump to 2.3.4
+
 ## 2.3.3
 
 - **Devices / Scenarios split** — main menu now separates physical Devices from Scenes/Scripts

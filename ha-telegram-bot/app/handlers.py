@@ -10,6 +10,7 @@ Forum supergroup thread support (message_thread_id).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -91,6 +92,9 @@ _WRITE_PREFIXES: frozenset[str] = frozenset({
     "qsc", "lcs", "gcl", "rad", "rout",
 })
 
+# Prefixes exempt from idempotency guard (debounce-eligible rapid taps)
+_DEBOUNCE_PREFIXES: frozenset[str] = frozenset({"bright", "mvol"})
+
 
 # ---------------------------------------------------------------------------
 # Global rate limiter
@@ -167,6 +171,16 @@ class Handlers:
         self._nav_stack: dict[int, list[str]] = {}
         # Radio state per chat: chat_id -> {station_idx, player_eid, playing}
         self._radio_state: dict[int, dict[str, Any]] = {}
+
+        # Per-user callback serialization lock
+        self._user_locks: dict[int, asyncio.Lock] = {}
+        # Idempotency guard: uid -> (callback_data, timestamp)
+        self._last_cb: dict[int, tuple[str, float]] = {}
+
+        # Debounce state for brightness / volume
+        self._pending_brightness: dict[tuple[int, int, str], int] = {}
+        self._pending_volume: dict[tuple[int, int, str], float] = {}
+        self._debounce_tasks: dict[tuple[int, int, str], asyncio.Task[None]] = {}
 
     # -----------------------------------------------------------------------
     # Security
@@ -251,8 +265,9 @@ class Handlers:
     # -----------------------------------------------------------------------
 
     async def _check_rl(self, user_id: int, action: str, cb: CallbackQuery) -> bool:
+        cd = self._cfg.cooldown_overrides.get(action, self._cfg.cooldown_seconds_default)
         allowed, remaining = await self._db.check_and_update_cooldown(
-            user_id, action, self._cfg.cooldown_seconds,
+            user_id, action, cd,
         )
         if not allowed:
             await cb.answer(f"\u23f1\ufe0f Подождите {remaining:.1f}с.", show_alert=True)
@@ -617,22 +632,33 @@ class Handlers:
             await callback.answer("\u26d4 Нет доступа.", show_alert=True)
             return
 
-        # Role check for write actions
+        # Idempotency guard: reject duplicate (uid, data) within 0.25s
         prefix = data.split(":", 1)[0] if ":" in data else data
+        now = time.time()
+        last = self._last_cb.get(uid)
+        if last and last[0] == data and (now - last[1]) < 0.25 and prefix not in _DEBOUNCE_PREFIXES:
+            await callback.answer()
+            return
+        self._last_cb[uid] = (data, now)
+
+        # Role check for write actions
         if prefix in _WRITE_PREFIXES:
             if not await self._check_role(uid, "user"):
                 await callback.answer("\u26d4 Недостаточно прав (guest).", show_alert=True)
                 return
 
-        try:
-            handler = self._ROUTES.get(prefix)
-            if handler:
-                await handler(self, cid, uid, uname, data, callback)
-            else:
-                await callback.answer("Неизвестное действие.", show_alert=True)
-        except Exception:
-            logger.exception("Callback error: %s", data)
-            await callback.answer("Произошла ошибка.", show_alert=True)
+        # Per-user lock to serialize callback handling
+        lock = self._user_locks.setdefault(uid, asyncio.Lock())
+        async with lock:
+            try:
+                handler = self._ROUTES.get(prefix)
+                if handler:
+                    await handler(self, cid, uid, uname, data, callback)
+                else:
+                    await callback.answer("Неизвестное действие.", show_alert=True)
+            except Exception:
+                logger.exception("Callback error: %s", data)
+                await callback.answer("Произошла ошибка.", show_alert=True)
 
     # -----------------------------------------------------------------------
     # nav: — back navigation
@@ -1077,14 +1103,45 @@ class Handlers:
         if not await self._check_rl(uid, "light.brightness", cb):
             return
 
-        state = await self._ha.get_state(eid)
-        current = (state.get("attributes", {}).get("brightness", 128) or 128) if state else 128
+        key = (cid, uid, eid)
+
+        # Use pending value if mid-debounce, otherwise fetch HA state
+        if key in self._pending_brightness:
+            current = self._pending_brightness[key]
+        else:
+            state = await self._ha.get_state(eid)
+            current = (state.get("attributes", {}).get("brightness", 128) or 128) if state else 128
+
         step = 51
         new_br = min(255, current + step) if direction == "up" else max(1, current - step)
+        self._pending_brightness[key] = new_br
 
-        await cb.answer("\U0001f506 Яркость...")
+        pct = round(new_br / 255 * 100)
+        await cb.answer(f"\U0001f506 {pct}%")
+
+        # Cancel existing debounce task, schedule new one
+        existing = self._debounce_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+        self._debounce_tasks[key] = asyncio.create_task(
+            self._flush_brightness(key, cid, uid, uname, eid),
+        )
+
+    async def _flush_brightness(
+        self, key: tuple[int, int, str], cid: int, uid: int, uname: str, eid: str,
+    ) -> None:
+        """Debounce flush: wait, then send ONE HA call with the latest brightness."""
+        try:
+            await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            return
+        target = self._pending_brightness.pop(key, None)
+        self._debounce_tasks.pop(key, None)
+        if target is None:
+            return
+
         ok, err = await self._ha.call_service(
-            "light", "turn_on", {"entity_id": eid, "brightness": new_br},
+            "light", "turn_on", {"entity_id": eid, "brightness": target},
         )
         if ok:
             self._rl.record()
@@ -1141,13 +1198,55 @@ class Handlers:
         if not await self._check_rl(uid, "media_player.volume", cb):
             return
 
-        await cb.answer("\U0001f50a Громкость...")
-        service = "volume_up" if direction == "up" else "volume_down"
-        ok, err = await self._ha.call_service("media_player", service, {"entity_id": eid})
+        key = (cid, uid, eid)
+        vol_step = 0.05
+
+        # Use pending value if mid-debounce, otherwise fetch HA state
+        if key in self._pending_volume:
+            current_vol = self._pending_volume[key]
+        else:
+            state = await self._ha.get_state(eid)
+            raw_vol = state.get("attributes", {}).get("volume_level", 0.5) if state else 0.5
+            try:
+                current_vol = float(raw_vol or 0.5)
+            except (TypeError, ValueError):
+                current_vol = 0.5
+
+        new_vol = min(1.0, current_vol + vol_step) if direction == "up" else max(0.0, current_vol - vol_step)
+        self._pending_volume[key] = new_vol
+
+        pct = round(new_vol * 100)
+        await cb.answer(f"\U0001f50a {pct}%")
+
+        # Cancel existing debounce task, schedule new one
+        existing = self._debounce_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+        self._debounce_tasks[key] = asyncio.create_task(
+            self._flush_volume(key, cid, uid, uname, eid),
+        )
+
+    async def _flush_volume(
+        self, key: tuple[int, int, str], cid: int, uid: int, uname: str, eid: str,
+    ) -> None:
+        """Debounce flush: wait, then send ONE volume_set call."""
+        try:
+            await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            return
+        target = self._pending_volume.pop(key, None)
+        self._debounce_tasks.pop(key, None)
+        if target is None:
+            return
+
+        ok, err = await self._ha.call_service(
+            "media_player", "volume_set",
+            {"entity_id": eid, "volume_level": round(target, 2)},
+        )
         if ok:
             self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
-                     action=f"media_player.{service}", entity_id=eid,
+                     action="media_player.volume_set", entity_id=eid,
                      success=ok, error=err if not ok else None)
         if ok:
             await self._show_entity_control(cid, uid, eid)
@@ -1998,6 +2097,12 @@ class Handlers:
     async def _do_refresh(self, cid: int) -> None:
         t, k = build_confirmation("\U0001f504 Синхронизация с Home Assistant...", "nav:main")
         await self._send_or_edit(cid, t, k, menu="refreshing")
+
+        # Snapshot before sync for diff
+        old_areas = set(self._reg.areas.keys())
+        old_devices = set(self._reg.devices.keys())
+        old_entities = set(self._reg.entities.keys())
+
         try:
             ok = await self._reg.sync()
         except Exception:
@@ -2024,6 +2129,40 @@ class Handlers:
                 if btns:
                     vname = self._reg.get_entity_display_name(vac_eid)
                     lines.append(f"  \u2514 {vname}: {len(btns)} сценариев")
+
+            # Diff summary
+            new_areas = set(self._reg.areas.keys())
+            new_devices = set(self._reg.devices.keys())
+            new_entities = set(self._reg.entities.keys())
+
+            diff_parts: list[str] = []
+            added_a = len(new_areas - old_areas)
+            removed_a = len(old_areas - new_areas)
+            added_d = len(new_devices - old_devices)
+            removed_d = len(old_devices - new_devices)
+            added_e = len(new_entities - old_entities)
+            removed_e = len(old_entities - new_entities)
+
+            if added_a:
+                diff_parts.append(f"+{added_a} комнат")
+            if removed_a:
+                diff_parts.append(f"-{removed_a} комнат")
+            if added_d:
+                diff_parts.append(f"+{added_d} устройств")
+            if removed_d:
+                diff_parts.append(f"-{removed_d} устройств")
+            if added_e:
+                diff_parts.append(f"+{added_e} сущностей")
+            if removed_e:
+                diff_parts.append(f"-{removed_e} сущностей")
+
+            if diff_parts:
+                lines.append("")
+                lines.append(f"\U0001f504 Изменения: {', '.join(diff_parts)}")
+            else:
+                lines.append("")
+                lines.append("\u2714 Изменений не обнаружено.")
+
             msg = "\n".join(lines)
         else:
             msg = "\u274c Ошибка синхронизации. Проверьте логи."

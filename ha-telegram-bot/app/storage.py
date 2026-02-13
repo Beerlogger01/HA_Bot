@@ -200,7 +200,7 @@ class Database:
     # --- cooldown ---
 
     async def check_and_update_cooldown(
-        self, user_id: int, action: str, cooldown_seconds: int
+        self, user_id: int, action: str, cooldown_seconds: float
     ) -> tuple[bool, float]:
         assert self._db is not None
         now = time.time()

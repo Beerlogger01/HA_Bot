@@ -93,7 +93,8 @@ class Config:
     bot_token: str
     allowed_chat_id: int
     allowed_user_ids: frozenset[int]
-    cooldown_seconds: int
+    cooldown_seconds_default: float
+    cooldown_overrides: dict[str, float]
     global_rate_limit_actions: int
     global_rate_limit_window: int
     status_entities: tuple[str, ...]
@@ -169,10 +170,29 @@ def _load_and_validate_config() -> tuple[Config, str]:
     if not user_ids:
         logger.warning("allowed_user_ids is empty — open mode, any user accepted")
 
-    # -- rate limiting --
-    cooldown = raw.get("cooldown_seconds", 2)
-    if not isinstance(cooldown, int) or cooldown < 0:
-        cooldown = 2
+    # -- rate limiting (backward compat: accept old cooldown_seconds int) --
+    cooldown_default_raw = raw.get(
+        "cooldown_seconds_default", raw.get("cooldown_seconds", 2.0),
+    )
+    try:
+        cooldown_default = max(0.0, float(cooldown_default_raw))
+    except (TypeError, ValueError):
+        cooldown_default = 2.0
+
+    cooldown_overrides_raw = raw.get("cooldown_overrides", {})
+    cooldown_overrides: dict[str, float] = {}
+    if isinstance(cooldown_overrides_raw, dict):
+        for k, v in cooldown_overrides_raw.items():
+            try:
+                cooldown_overrides[str(k)] = max(0.0, float(v))
+            except (TypeError, ValueError):
+                logger.warning("Invalid cooldown override for %s: %r", k, v)
+    # Sensible defaults for rapid-fire controls
+    if not cooldown_overrides:
+        cooldown_overrides = {
+            "light.brightness": 0.2,
+            "media_player.volume": 0.2,
+        }
 
     rate_actions = raw.get("global_rate_limit_actions", 10)
     if not isinstance(rate_actions, int) or rate_actions < 1:
@@ -255,7 +275,8 @@ def _load_and_validate_config() -> tuple[Config, str]:
         bot_token=bot_token.strip(),
         allowed_chat_id=allowed_chat_id,
         allowed_user_ids=frozenset(user_ids),
-        cooldown_seconds=cooldown,
+        cooldown_seconds_default=cooldown_default,
+        cooldown_overrides=cooldown_overrides,
         global_rate_limit_actions=rate_actions,
         global_rate_limit_window=rate_window,
         status_entities=status_ents,
@@ -316,24 +337,46 @@ class TelegramBot:
     # Startup helpers
     # -------------------------------------------------------------------
 
-    async def _wait_for_ha(self) -> str:
+    async def _wait_for_ha(self) -> tuple[str, bool]:
         """Try to reach HA Core with exponential backoff.
 
-        Returns HA version string on success, empty string on failure.
+        Returns (ha_version, registry_synced).
+        Empty version means HA was never reachable.
         """
         delay = _READINESS_BASE_DELAY
+        ha_version = ""
         for attempt in range(1, _READINESS_MAX_ATTEMPTS + 1):
-            ha_cfg = await self._ha.get_config()
-            if ha_cfg:
-                return ha_cfg.get("version", "unknown")
+            # Step 1: Check HA Core config API (once)
+            if not ha_version:
+                ha_cfg = await self._ha.get_config()
+                if ha_cfg:
+                    ha_version = ha_cfg.get("version", "unknown")
+                    logger.info("HA API reachable — version %s", ha_version)
+                else:
+                    if attempt < _READINESS_MAX_ATTEMPTS:
+                        logger.warning(
+                            "HA not ready (attempt %d/%d), retrying in %.0fs...",
+                            attempt, _READINESS_MAX_ATTEMPTS, delay,
+                        )
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 30)
+                    continue
+
+            # Step 2: Attempt registry sync
+            sync_ok = await self._do_registry_sync()
+            if sync_ok:
+                return ha_version, True
+
+            # Config OK but sync failed — integrations may still be loading
             if attempt < _READINESS_MAX_ATTEMPTS:
                 logger.warning(
-                    "HA not ready (attempt %d/%d), retrying in %.0fs...",
+                    "Registry sync failed (attempt %d/%d), retrying in %.0fs...",
                     attempt, _READINESS_MAX_ATTEMPTS, delay,
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
-        return ""
+
+        return ha_version, False
 
     async def _do_registry_sync(self) -> bool:
         """Perform registry sync and log results."""
@@ -394,11 +437,12 @@ class TelegramBot:
         await self._ha.open()
 
         # Readiness gating — wait for HA with exponential backoff
-        ha_version = await self._wait_for_ha()
+        ha_version, sync_ok = await self._wait_for_ha()
         if ha_version:
             self._ha_ready = True
             logger.info("HA API self-test passed — version %s", ha_version)
-            await self._do_registry_sync()
+            if not sync_ok:
+                logger.warning("Registry sync failed during startup — navigation may be limited")
         else:
             ha_version = "unknown"
             logger.warning(
@@ -478,7 +522,7 @@ class TelegramBot:
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
 
         mode_label = "degraded" if not self._ha_ready else "full"
-        logger.info("Bot polling started (v2.3.3, mode=%s)", mode_label)
+        logger.info("Bot polling started (v2.3.4, mode=%s)", mode_label)
 
         await self._dp.start_polling(
             self._bot,

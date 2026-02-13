@@ -841,7 +841,7 @@ class TestMainMenuActiveButton:
 class TestReadinessGating:
     @pytest.mark.asyncio
     async def test_wait_for_ha_success_first_try(self) -> None:
-        """If HA responds immediately, _wait_for_ha returns version."""
+        """If HA responds immediately and sync succeeds, returns (version, True)."""
         import app as app_mod
 
         # Save originals
@@ -854,9 +854,17 @@ class TestReadinessGating:
             bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
             bot._ha = MagicMock()
             bot._ha.get_config = AsyncMock(return_value={"version": "2024.1.0"})
+            bot._registry = MagicMock()
+            bot._registry.sync = AsyncMock(return_value=True)
+            bot._registry.floors = {"f1": None}
+            bot._registry.areas = {"a1": None}
+            bot._registry.devices = {"d1": None}
+            bot._registry.entities = {"e1": None}
+            bot._registry.vacuum_routines = {}
 
-            version = await bot._wait_for_ha()
+            version, sync_ok = await bot._wait_for_ha()
             assert version == "2024.1.0"
+            assert sync_ok is True
             assert bot._ha.get_config.call_count == 1
         finally:
             app_mod._READINESS_MAX_ATTEMPTS = orig_max
@@ -878,9 +886,17 @@ class TestReadinessGating:
             bot._ha.get_config = AsyncMock(
                 side_effect=[None, None, {"version": "2024.2.0"}]
             )
+            bot._registry = MagicMock()
+            bot._registry.sync = AsyncMock(return_value=True)
+            bot._registry.floors = {"f1": None}
+            bot._registry.areas = {"a1": None}
+            bot._registry.devices = {"d1": None}
+            bot._registry.entities = {"e1": None}
+            bot._registry.vacuum_routines = {}
 
-            version = await bot._wait_for_ha()
+            version, sync_ok = await bot._wait_for_ha()
             assert version == "2024.2.0"
+            assert sync_ok is True
             assert bot._ha.get_config.call_count == 3
         finally:
             app_mod._READINESS_MAX_ATTEMPTS = orig_max
@@ -888,7 +904,7 @@ class TestReadinessGating:
 
     @pytest.mark.asyncio
     async def test_wait_for_ha_all_fail(self) -> None:
-        """All attempts fail — returns empty string."""
+        """All attempts fail — returns empty version and False."""
         import app as app_mod
 
         orig_max = app_mod._READINESS_MAX_ATTEMPTS
@@ -901,8 +917,9 @@ class TestReadinessGating:
             bot._ha = MagicMock()
             bot._ha.get_config = AsyncMock(return_value=None)
 
-            version = await bot._wait_for_ha()
+            version, sync_ok = await bot._wait_for_ha()
             assert version == ""
+            assert sync_ok is False
             assert bot._ha.get_config.call_count == 3
         finally:
             app_mod._READINESS_MAX_ATTEMPTS = orig_max
@@ -975,3 +992,319 @@ class TestReadinessGating:
             bot._registry.sync.assert_called()
         finally:
             app_mod._RECOVERY_INTERVAL = orig_interval
+
+
+# ---------------------------------------------------------------------------
+# Per-action cooldown tests
+# ---------------------------------------------------------------------------
+
+
+class TestPerActionCooldown:
+    @pytest.mark.asyncio
+    async def test_float_cooldown(self, db) -> None:
+        """Float cooldown values work correctly."""
+        uid, action = 1, "light.brightness"
+
+        allowed, remaining = await db.check_and_update_cooldown(uid, action, 0.2)
+        assert allowed is True
+        assert remaining == 0.0
+
+        # Immediate retry with 0.2s cooldown
+        allowed, remaining = await db.check_and_update_cooldown(uid, action, 0.2)
+        assert allowed is False
+        assert 0 < remaining <= 0.2
+
+    @pytest.mark.asyncio
+    async def test_independent_action_cooldowns(self, db) -> None:
+        """Different actions have independent cooldowns."""
+        uid = 1
+
+        allowed, _ = await db.check_and_update_cooldown(uid, "light.turn_on", 60.0)
+        assert allowed is True
+
+        # Different action should be allowed
+        allowed, _ = await db.check_and_update_cooldown(uid, "light.brightness", 0.2)
+        assert allowed is True
+
+        # Original action still on cooldown
+        allowed, _ = await db.check_and_update_cooldown(uid, "light.turn_on", 60.0)
+        assert allowed is False
+
+    @pytest.mark.asyncio
+    async def test_zero_cooldown(self, db) -> None:
+        """Zero cooldown means always allowed."""
+        uid, action = 1, "instant"
+
+        allowed, _ = await db.check_and_update_cooldown(uid, action, 0.0)
+        assert allowed is True
+        allowed, _ = await db.check_and_update_cooldown(uid, action, 0.0)
+        assert allowed is True
+
+
+# ---------------------------------------------------------------------------
+# Brightness debounce tests
+# ---------------------------------------------------------------------------
+
+
+class TestBrightnessDebounce:
+    def test_pending_dict_state(self) -> None:
+        """Pending brightness dict tracks (cid, uid, eid) -> brightness value."""
+        from handlers import Handlers
+
+        h = Handlers.__new__(Handlers)
+        h._pending_brightness = {}
+        h._pending_volume = {}
+        h._debounce_tasks = {}
+
+        key = (100, 200, "light.test")
+        h._pending_brightness[key] = 128
+        assert h._pending_brightness[key] == 128
+
+        # Update brightness
+        h._pending_brightness[key] = 179
+        assert h._pending_brightness[key] == 179
+
+    def test_flush_cleanup(self) -> None:
+        """After flush, pending state and task refs are cleared."""
+        from handlers import Handlers
+
+        h = Handlers.__new__(Handlers)
+        h._pending_brightness = {}
+        h._pending_volume = {}
+        h._debounce_tasks = {}
+
+        key = (100, 200, "light.test")
+        h._pending_brightness[key] = 200
+
+        # Simulate flush cleanup
+        target = h._pending_brightness.pop(key, None)
+        h._debounce_tasks.pop(key, None)
+
+        assert target == 200
+        assert key not in h._pending_brightness
+        assert key not in h._debounce_tasks
+
+    def test_volume_pending_dict(self) -> None:
+        """Pending volume dict tracks float values."""
+        from handlers import Handlers
+
+        h = Handlers.__new__(Handlers)
+        h._pending_brightness = {}
+        h._pending_volume = {}
+        h._debounce_tasks = {}
+
+        key = (100, 200, "media_player.tv")
+        h._pending_volume[key] = 0.55
+        assert h._pending_volume[key] == 0.55
+
+        h._pending_volume[key] = 0.60
+        assert h._pending_volume[key] == 0.60
+
+
+# ---------------------------------------------------------------------------
+# Callback race protection tests
+# ---------------------------------------------------------------------------
+
+
+class TestCallbackRaceProtection:
+    def test_debounce_prefixes_constant(self) -> None:
+        """_DEBOUNCE_PREFIXES is defined and contains expected prefixes."""
+        from handlers import _DEBOUNCE_PREFIXES
+        assert isinstance(_DEBOUNCE_PREFIXES, frozenset)
+        assert "bright" in _DEBOUNCE_PREFIXES
+        assert "mvol" in _DEBOUNCE_PREFIXES
+        assert "act" not in _DEBOUNCE_PREFIXES
+
+    def test_idempotency_guard_state(self) -> None:
+        """_last_cb dict tracks (data, timestamp) per user."""
+        from handlers import Handlers
+
+        h = Handlers.__new__(Handlers)
+        h._last_cb = {}
+
+        uid = 123
+        now = time.time()
+        h._last_cb[uid] = ("act:light.test:turn_on", now)
+
+        last = h._last_cb.get(uid)
+        assert last is not None
+        assert last[0] == "act:light.test:turn_on"
+        assert (now - last[1]) < 0.01
+
+    def test_idempotency_guard_duplicate_detection(self) -> None:
+        """Same (uid, data) within 0.25s should be detected as duplicate."""
+        now = time.time()
+        data = "act:light.test:turn_on"
+        uid = 123
+
+        last_cb: dict[int, tuple[str, float]] = {}
+        last_cb[uid] = (data, now)
+
+        # Same data, within window
+        last = last_cb.get(uid)
+        is_duplicate = last and last[0] == data and (now - last[1]) < 0.25
+        assert is_duplicate
+
+        # Different data, within window
+        last_cb[uid] = ("fav:light.test", now)
+        last = last_cb.get(uid)
+        is_duplicate = last and last[0] == data and (now - last[1]) < 0.25
+        assert not is_duplicate
+
+    def test_debounce_prefix_exemption(self) -> None:
+        """Debounce prefixes should be exempt from idempotency guard."""
+        from handlers import _DEBOUNCE_PREFIXES
+
+        data = "bright:light.test:up"
+        prefix = data.split(":", 1)[0]
+        assert prefix in _DEBOUNCE_PREFIXES
+
+        data2 = "mvol:media_player.tv:up"
+        prefix2 = data2.split(":", 1)[0]
+        assert prefix2 in _DEBOUNCE_PREFIXES
+
+        data3 = "act:light.test:turn_on"
+        prefix3 = data3.split(":", 1)[0]
+        assert prefix3 not in _DEBOUNCE_PREFIXES
+
+
+# ---------------------------------------------------------------------------
+# Readiness with sync tests
+# ---------------------------------------------------------------------------
+
+
+class TestReadinessWithSync:
+    @pytest.mark.asyncio
+    async def test_config_ok_sync_ok(self) -> None:
+        """Config OK + sync OK on first try returns (version, True)."""
+        import app as app_mod
+
+        orig_max = app_mod._READINESS_MAX_ATTEMPTS
+        orig_delay = app_mod._READINESS_BASE_DELAY
+        try:
+            app_mod._READINESS_MAX_ATTEMPTS = 3
+            app_mod._READINESS_BASE_DELAY = 0.01
+
+            bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+            bot._ha = MagicMock()
+            bot._ha.get_config = AsyncMock(return_value={"version": "2024.5.0"})
+            bot._registry = MagicMock()
+            bot._registry.sync = AsyncMock(return_value=True)
+            bot._registry.floors = {}
+            bot._registry.areas = {}
+            bot._registry.devices = {}
+            bot._registry.entities = {}
+            bot._registry.vacuum_routines = {}
+
+            version, sync_ok = await bot._wait_for_ha()
+            assert version == "2024.5.0"
+            assert sync_ok is True
+        finally:
+            app_mod._READINESS_MAX_ATTEMPTS = orig_max
+            app_mod._READINESS_BASE_DELAY = orig_delay
+
+    @pytest.mark.asyncio
+    async def test_config_ok_sync_retries(self) -> None:
+        """Config OK but sync fails then succeeds."""
+        import app as app_mod
+
+        orig_max = app_mod._READINESS_MAX_ATTEMPTS
+        orig_delay = app_mod._READINESS_BASE_DELAY
+        try:
+            app_mod._READINESS_MAX_ATTEMPTS = 5
+            app_mod._READINESS_BASE_DELAY = 0.01
+
+            bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+            bot._ha = MagicMock()
+            bot._ha.get_config = AsyncMock(return_value={"version": "2024.5.0"})
+            bot._registry = MagicMock()
+            bot._registry.sync = AsyncMock(side_effect=[False, False, True])
+            bot._registry.floors = {}
+            bot._registry.areas = {}
+            bot._registry.devices = {}
+            bot._registry.entities = {}
+            bot._registry.vacuum_routines = {}
+
+            version, sync_ok = await bot._wait_for_ha()
+            assert version == "2024.5.0"
+            assert sync_ok is True
+            assert bot._registry.sync.call_count == 3
+        finally:
+            app_mod._READINESS_MAX_ATTEMPTS = orig_max
+            app_mod._READINESS_BASE_DELAY = orig_delay
+
+    @pytest.mark.asyncio
+    async def test_config_ok_sync_all_fail(self) -> None:
+        """Config OK but sync always fails returns (version, False)."""
+        import app as app_mod
+
+        orig_max = app_mod._READINESS_MAX_ATTEMPTS
+        orig_delay = app_mod._READINESS_BASE_DELAY
+        try:
+            app_mod._READINESS_MAX_ATTEMPTS = 3
+            app_mod._READINESS_BASE_DELAY = 0.01
+
+            bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+            bot._ha = MagicMock()
+            bot._ha.get_config = AsyncMock(return_value={"version": "2024.5.0"})
+            bot._registry = MagicMock()
+            bot._registry.sync = AsyncMock(return_value=False)
+
+            version, sync_ok = await bot._wait_for_ha()
+            assert version == "2024.5.0"
+            assert sync_ok is False
+        finally:
+            app_mod._READINESS_MAX_ATTEMPTS = orig_max
+            app_mod._READINESS_BASE_DELAY = orig_delay
+
+
+# ---------------------------------------------------------------------------
+# Sync diff tests
+# ---------------------------------------------------------------------------
+
+
+class TestSyncDiff:
+    def test_added_entities(self) -> None:
+        """Set difference correctly identifies added entities."""
+        old = {"light.a", "light.b"}
+        new = {"light.a", "light.b", "light.c", "switch.d"}
+        added = new - old
+        removed = old - new
+        assert added == {"light.c", "switch.d"}
+        assert removed == set()
+
+    def test_removed_entities(self) -> None:
+        """Set difference correctly identifies removed entities."""
+        old = {"light.a", "light.b", "switch.c"}
+        new = {"light.a"}
+        added = new - old
+        removed = old - new
+        assert added == set()
+        assert removed == {"light.b", "switch.c"}
+
+    def test_mixed_changes(self) -> None:
+        """Both additions and removals detected correctly."""
+        old = {"light.a", "light.b", "switch.c"}
+        new = {"light.a", "switch.d", "fan.e"}
+        added = new - old
+        removed = old - new
+        assert added == {"switch.d", "fan.e"}
+        assert removed == {"light.b", "switch.c"}
+
+    def test_no_changes(self) -> None:
+        """Identical sets produce no diff."""
+        old = {"light.a", "light.b"}
+        new = {"light.a", "light.b"}
+        added = new - old
+        removed = old - new
+        assert added == set()
+        assert removed == set()
+
+    def test_empty_to_full(self) -> None:
+        """First sync: empty -> populated shows all as added."""
+        old: set[str] = set()
+        new = {"light.a", "light.b", "switch.c"}
+        added = new - old
+        removed = old - new
+        assert len(added) == 3
+        assert removed == set()
