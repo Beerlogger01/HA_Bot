@@ -27,6 +27,8 @@ from registry import HARegistry
 from scheduler import Scheduler, next_cron_time, validate_cron
 from storage import Database
 from ui import (
+    _ACTIVE_STATES,
+    build_active_now_menu,
     build_areas_menu,
     build_confirmation,
     build_device_list,
@@ -651,6 +653,8 @@ class Handlers:
         elif target == "help":
             t, k = build_help_menu()
             await self._send_or_edit(cid, t, k, menu="help")
+        elif target == "active":
+            await self._show_active_now(cid, uid, 0)
 
     # -----------------------------------------------------------------------
     # fl: — floor selected
@@ -661,6 +665,7 @@ class Handlers:
         await cb.answer()
 
         domains = frozenset(self._cfg.menu_domains_allowlist)
+        sa = self._cfg.show_all_enabled
 
         if floor_id == "__none__":
             areas = self._reg.get_unassigned_areas()
@@ -669,11 +674,11 @@ class Handlers:
 
         area_dicts = []
         for a in areas:
-            eids = self._reg.get_area_entities(a.area_id, domains)
+            eids = self._reg.get_area_entities(a.area_id, domains, show_all=sa)
             if eids:
                 area_dicts.append({"area_id": a.area_id, "name": a.name, "entity_count": len(eids)})
 
-        unassigned = self._reg.get_unassigned_entities(domains)
+        unassigned = self._reg.get_unassigned_entities(domains, show_all=sa)
 
         back = "nav:manage" if self._reg.has_floors else "nav:main"
         floor_name = ""
@@ -698,11 +703,12 @@ class Handlers:
         await cb.answer()
 
         domains = frozenset(self._cfg.menu_domains_allowlist)
+        sa = self._cfg.show_all_enabled
         if area_id == "__none__":
-            devices = self._reg.get_unassigned_devices(domains)
+            devices = self._reg.get_unassigned_devices(domains, show_all=sa)
             title = "\U0001f4e6 <b>Без комнаты</b>"
         else:
-            devices = self._reg.get_devices_for_area(area_id, domains)
+            devices = self._reg.get_devices_for_area(area_id, domains, show_all=sa)
             area = self._reg.areas.get(area_id)
             title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
 
@@ -748,11 +754,12 @@ class Handlers:
         await cb.answer()
 
         domains = frozenset(self._cfg.menu_domains_allowlist)
+        sa = self._cfg.show_all_enabled
         if area_id == "__none__":
-            devices = self._reg.get_unassigned_devices(domains)
+            devices = self._reg.get_unassigned_devices(domains, show_all=sa)
             title = "\U0001f4e6 <b>Без комнаты</b>"
         else:
-            devices = self._reg.get_devices_for_area(area_id, domains)
+            devices = self._reg.get_devices_for_area(area_id, domains, show_all=sa)
             area = self._reg.areas.get(area_id)
             title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
 
@@ -1212,7 +1219,8 @@ class Handlers:
             area_id = current_menu.split(":", 1)[1].split(":", 1)[0]
             # Re-render the area page
             domains = frozenset(self._cfg.menu_domains_allowlist)
-            devices = self._reg.get_devices_for_area(area_id, domains)
+            sa = self._cfg.show_all_enabled
+            devices = self._reg.get_devices_for_area(area_id, domains, show_all=sa)
             area = self._reg.areas.get(area_id)
             title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
             is_pinned = await self._db.is_pinned(uid, "area", area_id)
@@ -1430,6 +1438,25 @@ class Handlers:
 
         t, k = build_search_results("...", cached, page, self._cfg.menu_page_size)
         await self._send_or_edit(cid, t, k, menu="search_results")
+
+    # -----------------------------------------------------------------------
+    # actp: — active now pagination
+    # -----------------------------------------------------------------------
+
+    async def _active_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        try:
+            page = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            page = 0
+        await cb.answer()
+
+        cached = self._search_cache.get(cid, [])
+        if not cached:
+            await self._show_active_now(cid, uid, 0)
+            return
+
+        t, k = build_active_now_menu(cached, page, self._cfg.menu_page_size)
+        await self._send_or_edit(cid, t, k, menu="active")
 
     # -----------------------------------------------------------------------
     # diag: — diagnostics callbacks
@@ -1744,13 +1771,14 @@ class Handlers:
 
     async def _show_floors(self, cid: int) -> None:
         domains = frozenset(self._cfg.menu_domains_allowlist)
+        sa = self._cfg.show_all_enabled
         floors_sorted = self._reg.get_floors_sorted()
         floor_dicts = []
         for f in floors_sorted:
             areas = self._reg.get_areas_for_floor(f.floor_id)
             area_count = 0
             for a in areas:
-                if self._reg.get_area_entities(a.area_id, domains):
+                if self._reg.get_area_entities(a.area_id, domains, show_all=sa):
                     area_count += 1
             if area_count > 0:
                 floor_dicts.append({
@@ -1762,7 +1790,7 @@ class Handlers:
         unassigned_areas = self._reg.get_unassigned_areas()
         ua_count = sum(
             1 for a in unassigned_areas
-            if self._reg.get_area_entities(a.area_id, domains)
+            if self._reg.get_area_entities(a.area_id, domains, show_all=sa)
         )
 
         t, k = build_floors_menu(floor_dicts, ua_count)
@@ -1771,14 +1799,15 @@ class Handlers:
     async def _show_areas_direct(self, cid: int) -> None:
         """Show all areas without floor grouping."""
         domains = frozenset(self._cfg.menu_domains_allowlist)
+        sa = self._cfg.show_all_enabled
         all_areas = self._reg.get_all_areas_sorted()
         area_dicts = []
         for a in all_areas:
-            eids = self._reg.get_area_entities(a.area_id, domains)
+            eids = self._reg.get_area_entities(a.area_id, domains, show_all=sa)
             if eids:
                 area_dicts.append({"area_id": a.area_id, "name": a.name, "entity_count": len(eids)})
 
-        unassigned = self._reg.get_unassigned_entities(domains)
+        unassigned = self._reg.get_unassigned_entities(domains, show_all=sa)
         t, k = build_areas_menu(
             area_dicts, back_target="nav:main",
             unassigned_entity_count=len(unassigned),
@@ -1792,6 +1821,32 @@ class Handlers:
         pinned = await self._db.get_pinned_items(uid)
         t, k = build_favorites_menu(ent_list, page, self._cfg.menu_page_size, fav_actions, pinned)
         await self._send_or_edit(cid, t, k, menu="favorites")
+
+    async def _show_active_now(self, cid: int, uid: int, page: int) -> None:
+        """Show all entities that are currently in an active state."""
+        domains = frozenset(self._cfg.menu_domains_allowlist)
+        all_states = await self._ha.list_states()
+        active: list[dict[str, Any]] = []
+        for s in all_states:
+            eid = s.get("entity_id", "")
+            if not eid:
+                continue
+            domain = eid.split(".", 1)[0]
+            if domain not in domains:
+                continue
+            state_val = s.get("state", "")
+            if state_val in _ACTIVE_STATES:
+                fname = s.get("attributes", {}).get("friendly_name", eid)
+                active.append({
+                    "entity_id": eid,
+                    "friendly_name": fname,
+                    "state": state_val,
+                    "domain": domain,
+                })
+        # Cache for pagination
+        self._search_cache[cid] = active
+        t, k = build_active_now_menu(active, page, self._cfg.menu_page_size)
+        await self._send_or_edit(cid, t, k, menu="active")
 
     async def _show_fav_actions(self, cid: int, uid: int, page: int) -> None:
         actions = await self._db.get_favorite_actions(uid)
@@ -1928,6 +1983,7 @@ class Handlers:
         "fa_run": _fav_action_run,
         "fa_del": _fav_action_del,
         "srp": _search_page,
+        "actp": _active_page,
         "diag": _diag_cb,
         "snap": _snap_detail,
         "snapdiff": _snap_diff,

@@ -380,7 +380,7 @@ class TelegramBot:
         user_count = len(self._config.allowed_user_ids)
         user_mode = f"{user_count} allowed user(s)" if user_count > 0 else "any user"
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
-        logger.info("Bot polling started (v2.3.0)")
+        logger.info("Bot polling started (v2.3.1)")
 
         await self._dp.start_polling(
             self._bot,

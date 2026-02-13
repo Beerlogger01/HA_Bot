@@ -91,6 +91,7 @@ class EntityInfo:
     disabled_by: str | None = None
     hidden_by: str | None = None
     translation_key: str | None = None
+    entity_category: str | None = None  # "diagnostic", "config", or None (primary)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +274,7 @@ class HARegistry:
                     disabled_by=item.get("disabled_by"),
                     hidden_by=item.get("hidden_by"),
                     translation_key=item.get("translation_key"),
+                    entity_category=item.get("entity_category"),
                 )
 
     # -------------------------------------------------------------------
@@ -479,18 +481,30 @@ class HARegistry:
         return sorted(self.areas.values(), key=lambda a: a.name)
 
     def get_area_entities(
-        self, area_id: str, domains: frozenset[str] | None = None
+        self, area_id: str, domains: frozenset[str] | None = None,
+        show_all: bool = False,
     ) -> list[str]:
-        """Entity IDs in an area, optionally filtered by domain."""
+        """Entity IDs in an area, optionally filtered by domain.
+
+        When show_all is False, hides entities with entity_category
+        "diagnostic" or "config" (these are usually junk sensors).
+        """
         area = self.areas.get(area_id)
         if not area:
             return []
         eids = area.entity_ids
         if domains:
             eids = [e for e in eids if e.split(".", 1)[0] in domains]
+        if not show_all:
+            eids = [
+                e for e in eids
+                if not (self.entities.get(e) and self.entities[e].entity_category in ("diagnostic", "config"))
+            ]
         return sorted(eids)
 
-    def get_unassigned_entities(self, domains: frozenset[str] | None = None) -> list[str]:
+    def get_unassigned_entities(
+        self, domains: frozenset[str] | None = None, show_all: bool = False,
+    ) -> list[str]:
         """Entities not in any area."""
         assigned: set[str] = set()
         for area in self.areas.values():
@@ -499,6 +513,8 @@ class HARegistry:
         for ent in self.entities.values():
             if ent.entity_id not in assigned and not ent.disabled_by:
                 if domains and ent.entity_id.split(".", 1)[0] not in domains:
+                    continue
+                if not show_all and ent.entity_category in ("diagnostic", "config"):
                     continue
                 result.append(ent.entity_id)
         return sorted(result)
@@ -548,6 +564,7 @@ class HARegistry:
 
     def get_devices_for_area(
         self, area_id: str, domains: frozenset[str] | None = None,
+        show_all: bool = False,
     ) -> list[dict[str, Any]]:
         """Group entities in an area by device_id for display.
 
@@ -563,6 +580,11 @@ class HARegistry:
         raw_eids = area.entity_ids
         if domains:
             raw_eids = [e for e in raw_eids if e.split(".", 1)[0] in domains]
+        if not show_all:
+            raw_eids = [
+                e for e in raw_eids
+                if not (self.entities.get(e) and self.entities[e].entity_category in ("diagnostic", "config"))
+            ]
 
         # Group by device_id
         device_entities: dict[str, list[str]] = {}
@@ -601,9 +623,10 @@ class HARegistry:
 
     def get_unassigned_devices(
         self, domains: frozenset[str] | None = None,
+        show_all: bool = False,
     ) -> list[dict[str, Any]]:
         """Group unassigned entities by device_id (same format as get_devices_for_area)."""
-        unassigned_eids = self.get_unassigned_entities(domains)
+        unassigned_eids = self.get_unassigned_entities(domains, show_all=show_all)
         if not unassigned_eids:
             return []
 

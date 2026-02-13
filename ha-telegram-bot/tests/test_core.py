@@ -690,3 +690,144 @@ class TestEntityControlEnhanced:
         text, kb = build_entity_control("number.vol", state)
         assert "Volume Number" in text
         assert "Диапазон" in text
+
+
+# ---------------------------------------------------------------------------
+# Active Now menu tests
+# ---------------------------------------------------------------------------
+
+
+class TestActiveNowMenu:
+    def test_empty(self) -> None:
+        from ui import build_active_now_menu
+        text, kb = build_active_now_menu([])
+        assert "Всё выключено" in text
+        # Should have refresh + back
+        assert len(kb.inline_keyboard) == 2
+
+    def test_with_data(self) -> None:
+        from ui import build_active_now_menu
+        entities = [
+            {"entity_id": "light.kitchen", "friendly_name": "Kitchen Light",
+             "state": "on", "domain": "light"},
+            {"entity_id": "vacuum.robo", "friendly_name": "Roborock",
+             "state": "cleaning", "domain": "vacuum"},
+        ]
+        text, kb = build_active_now_menu(entities, 0, 8)
+        assert "Активные сейчас" in text
+        assert "(2)" in text
+        assert len(kb.inline_keyboard) >= 3  # 2 entities + back
+
+    def test_pagination(self) -> None:
+        from ui import build_active_now_menu
+        entities = [
+            {"entity_id": f"light.l{i}", "friendly_name": f"Light {i}",
+             "state": "on", "domain": "light"}
+            for i in range(20)
+        ]
+        text, kb = build_active_now_menu(entities, 0, 8)
+        assert "стр. 1/3" in text
+
+    def test_active_states_set(self) -> None:
+        from ui import _ACTIVE_STATES
+        assert "on" in _ACTIVE_STATES
+        assert "playing" in _ACTIVE_STATES
+        assert "cleaning" in _ACTIVE_STATES
+        assert "open" in _ACTIVE_STATES
+        assert "off" not in _ACTIVE_STATES
+        assert "unavailable" not in _ACTIVE_STATES
+
+
+# ---------------------------------------------------------------------------
+# Smart entity hiding tests
+# ---------------------------------------------------------------------------
+
+
+class TestEntityCategoryFiltering:
+    def _build_registry(self):
+        """Build a minimal registry with entities of different categories."""
+        from registry import AreaInfo, EntityInfo, HARegistry
+        from unittest.mock import MagicMock
+
+        reg = HARegistry.__new__(HARegistry)
+        reg._token = ""
+        reg._db = MagicMock()
+        reg.floors = {}
+        reg.devices = {}
+        reg.vacuum_routines = {}
+        reg.vacuum_platforms = {}
+        reg._synced = False
+        reg.areas = {
+            "kitchen": AreaInfo(
+                area_id="kitchen", name="Kitchen",
+                entity_ids=["light.kitchen", "sensor.kitchen_temp", "sensor.kitchen_signal"],
+            ),
+        }
+        reg.entities = {
+            "light.kitchen": EntityInfo(
+                entity_id="light.kitchen", name="Kitchen Light",
+                entity_category=None,
+            ),
+            "sensor.kitchen_temp": EntityInfo(
+                entity_id="sensor.kitchen_temp", name="Kitchen Temp",
+                entity_category=None,
+            ),
+            "sensor.kitchen_signal": EntityInfo(
+                entity_id="sensor.kitchen_signal", name="Kitchen Signal Strength",
+                entity_category="diagnostic",
+            ),
+        }
+        return reg
+
+    def test_hides_diagnostic_by_default(self) -> None:
+        reg = self._build_registry()
+        eids = reg.get_area_entities("kitchen")
+        assert "light.kitchen" in eids
+        assert "sensor.kitchen_temp" in eids
+        assert "sensor.kitchen_signal" not in eids
+
+    def test_show_all_includes_diagnostic(self) -> None:
+        reg = self._build_registry()
+        eids = reg.get_area_entities("kitchen", show_all=True)
+        assert "sensor.kitchen_signal" in eids
+        assert len(eids) == 3
+
+    def test_domain_filter_plus_hiding(self) -> None:
+        reg = self._build_registry()
+        eids = reg.get_area_entities("kitchen", domains=frozenset({"sensor"}))
+        assert "sensor.kitchen_temp" in eids
+        assert "sensor.kitchen_signal" not in eids
+        assert "light.kitchen" not in eids
+
+    def test_config_category_hidden(self) -> None:
+        reg = self._build_registry()
+        # Add a config-category entity
+        from registry import EntityInfo
+        reg.entities["number.kitchen_cal"] = EntityInfo(
+            entity_id="number.kitchen_cal", name="Calibration",
+            entity_category="config",
+        )
+        reg.areas["kitchen"].entity_ids.append("number.kitchen_cal")
+        eids = reg.get_area_entities("kitchen")
+        assert "number.kitchen_cal" not in eids
+        eids_all = reg.get_area_entities("kitchen", show_all=True)
+        assert "number.kitchen_cal" in eids_all
+
+
+# ---------------------------------------------------------------------------
+# Main menu has Active Now button
+# ---------------------------------------------------------------------------
+
+
+class TestMainMenuActiveButton:
+    def test_main_menu_has_active(self) -> None:
+        from ui import build_main_menu
+        text, kb = build_main_menu()
+        # Find the Active button
+        found = False
+        for row in kb.inline_keyboard:
+            for btn in row:
+                if "Активные" in btn.text:
+                    assert btn.callback_data == "menu:active"
+                    found = True
+        assert found, "Active Now button not found in main menu"

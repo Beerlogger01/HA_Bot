@@ -99,15 +99,47 @@ def build_main_menu() -> tuple[str, InlineKeyboardMarkup]:
         [InlineKeyboardButton(text="\U0001f3db Управление", callback_data="menu:manage")],
         [
             InlineKeyboardButton(text="\u2b50 Избранное", callback_data="menu:favorites"),
-            InlineKeyboardButton(text="\U0001f514 Уведомления", callback_data="menu:notif"),
+            InlineKeyboardButton(text="\U0001f7e2 Активные", callback_data="menu:active"),
         ],
-        [InlineKeyboardButton(text="\U0001f6e0 Диагностика", callback_data="menu:diag")],
+        [
+            InlineKeyboardButton(text="\U0001f514 Уведомления", callback_data="menu:notif"),
+            InlineKeyboardButton(text="\U0001f6e0 Диагностика", callback_data="menu:diag"),
+        ],
         [
             InlineKeyboardButton(text="\U0001f50d Поиск", callback_data="menu:search"),
             InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:refresh"),
         ],
     ])
     return text, kb
+
+
+# Active states that indicate the entity is "on" / working
+_ACTIVE_STATES: frozenset[str] = frozenset({
+    "on", "open", "cleaning", "playing", "home", "unlocked",
+    "heating", "cooling", "drying", "returning",
+})
+
+
+def build_active_now_menu(
+    entities: list[dict[str, Any]],
+    page: int = 0,
+    page_size: int = 8,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Show entities that are currently in an active state."""
+    if not entities:
+        text = "\U0001f7e2 <b>Активные сейчас</b>\n\nВсё выключено."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:active")],
+            [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+        ])
+        return text, kb
+
+    return build_entity_list(
+        entities, page, page_size,
+        title=f"\U0001f7e2 <b>Активные сейчас</b> ({len(entities)})",
+        back_cb="nav:main",
+        page_cb_prefix="actp",
+    )
 
 
 # ---------------------------------------------------------------------------
