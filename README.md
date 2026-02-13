@@ -6,6 +6,12 @@ A secure, interactive Telegram bot for controlling Home Assistant devices. Featu
 
 - **Floors & Areas navigation**: Automatic sync of HA Floor/Area/Device/Entity registries via WebSocket API
 - **Dynamic device discovery**: Entities organized by floors -> areas -> devices with domain filtering
+- **Devices / Scenarios split**: Separate menu categories for physical devices and scenes/scripts
+- **Active Now**: Quick view of all currently active entities, deduplicated by device
+- **Light color presets**: 7 preset colors (Red, Orange, Yellow, Green, Blue, Purple, Warm White) for color-capable lights
+- **Global Light Color scenes**: Apply a color to ALL lights at once from main menu
+- **Radio menu**: Stream internet radio stations to any media_player with output selection
+- **Quick Room Scenes**: Scene/script entities at top of room menus for quick access
 - **Vacuum room targeting**: Segment-based cleaning with auto-detection + configurable presets
 - **Roborock routines**: Automatic discovery of routine button entities on vacuum devices
 - **Per-user favorites**: Star entities and save quick actions for instant access
@@ -17,11 +23,12 @@ A secure, interactive Telegram bot for controlling Home Assistant devices. Featu
 - **Role-based access control**: Admin / User / Guest hierarchy with write-action guards
 - **Settings export/import**: Backup and restore per-user favorites, notifications, and actions
 - **Forum supergroup support**: Proper message_thread_id handling for topic-based chats
+- **Breadcrumb navigation**: Back button uses per-chat stack; Home button on all submenus
 - **Clean message behavior**: Edit-in-place menus, no message clutter
 - **Security**: Whitelist-based chat and user authorization, deny-by-default
 - **Rate limiting**: Per-user cooldowns and global rate limits
 - **Audit logging**: Full action history in SQLite + structured JSON stdout logs
-- **HA API resilience**: Retries with exponential backoff, timeout handling
+- **HA API resilience**: Retries with exponential backoff, timeout handling, error hardening
 - **Multi-arch support**: Works on Raspberry Pi (aarch64, armv7)
 
 ## Installation
@@ -117,6 +124,13 @@ vacuum_room_presets:
   - kitchen
   - living_room
   - bedroom
+radio_stations:
+  - name: "Lounge FM"
+    url: "https://cast.loungefm.com.ua/lounge"
+  - name: "Radio Record"
+    url: "https://radiorecord.hostingradio.ru/rr_main96.aacp"
+  - name: "Europa Plus"
+    url: "https://ep256.hostingradio.ru:8052/europaplus256.mp3"
 ```
 
 #### Configuration Options
@@ -136,6 +150,7 @@ vacuum_room_presets:
 | `vacuum_room_strategy` | Room targeting mode: `script` or `service_data` | No | `service_data` |
 | `vacuum_room_script_entity_id` | Script entity for room cleaning (script mode) | No | `""` |
 | `vacuum_room_presets` | Predefined room names for vacuum targeting | No | see above |
+| `radio_stations` | List of radio stations (`name` + `url` objects) | No | 3 default stations |
 
 Legacy options (`light_entity_id`, `vacuum_entity_id`, `goodnight_scene_id`) are kept for backward compatibility but are optional and not required for any functionality.
 
@@ -183,35 +198,36 @@ Expected log output:
 
 ### Main Menu
 
-The main menu provides eight categories:
+The main menu provides these categories:
 
-- **Управление** — Browse devices by Floors -> Areas -> Entities with domain-specific controls
+- **Устройства** — Browse devices by Floors -> Areas -> Entities with domain-specific controls
+- **Сценарии** — All scene and script entities in one place
+- **Активные** — Quick view of currently active entities (on, playing, cleaning, etc.)
+- **Радио** — Stream internet radio to any media player
+- **Цвет света** — Apply a color preset to all lights at once
 - **Избранное** — Quick access to starred entities and saved quick actions
-- **Уведомления** — Manage state change subscriptions
-- **Поиск** — Search entities by name or ID
-- **Расписание** — View and manage scheduled tasks
-- **Обновить** — Re-sync floors, areas, devices, entities from HA
 - **Статус** — View current state of configured entities
+- **SYNC** — Re-sync floors, areas, devices, entities from HA
 
 ### Navigation Flow
 
 ```
 Main Menu
-├── Управление
+├── Устройства
 │   ├── Пространства (if floors exist)
-│   │   ├── Floor 1 -> Areas -> Entities -> Controls
-│   │   └── Floor 2 -> Areas -> Entities -> Controls
+│   │   ├── Floor 1 -> Areas -> Quick Scenes + Devices -> Controls
+│   │   └── Floor 2 -> Areas -> Quick Scenes + Devices -> Controls
 │   └── Комнаты (if no floors)
-│       ├── Area 1 -> Entities -> Controls
+│       ├── Area 1 -> Quick Scenes + Devices -> Controls
 │       └── Без комнаты -> Unassigned entities
+├── Сценарии -> All scenes/scripts -> Activate
+├── Активные -> Currently on entities -> Entity controls
+├── Радио -> Station picker -> Play/Stop/Next/Prev -> Output select
+├── Цвет света -> Color presets -> Apply to all lights
 ├── Избранное -> Starred entities -> Controls
 │   └── Быстрые действия -> Run / Delete saved actions
-├── Уведомления -> Subscribed entities -> Toggle/Mode
-├── Поиск -> Type query -> Results -> Entity controls
-├── Расписание -> List / Toggle / Delete scheduled tasks
-├── Обновить -> Re-sync registries
 ├── Статус -> Status entities
-└── Снимки -> Snapshot list -> Detail / Diff / Delete
+└── SYNC -> Re-sync registries (friendly summary)
 ```
 
 All menus use **edit-in-place**: pressing a button updates the existing message instead of sending a new one.
@@ -222,7 +238,7 @@ Each entity type gets domain-specific controls:
 
 | Domain | Available Actions |
 |--------|------------------|
-| `light` | ON / OFF / Toggle / Brightness +/- |
+| `light` | ON / OFF / Toggle / Brightness +/- / Color presets |
 | `switch` | ON / OFF / Toggle |
 | `cover` | Open / Stop / Close |
 | `climate` | Temperature +/- |
@@ -474,7 +490,7 @@ You'll see these log messages during the process:
 ```
 [WARNING] HA not ready (attempt 1/10), retrying in 3s...
 [WARNING] HA not reachable after 10 attempts — starting in degraded mode
-[INFO] Bot polling started (v2.3.2, mode=degraded)
+[INFO] Bot polling started (v2.3.3, mode=degraded)
 ...
 [INFO] HA API recovered — version 2024.x.x
 [INFO] Registry sync complete: N floors, N areas, N devices, N entities
@@ -487,7 +503,7 @@ No user action is required — the bot recovers on its own.
 
 Use this checklist to verify resilient startup behavior after installation or upgrade:
 
-- [ ] **Normal startup**: Start the add-on when HA Core is already running. Logs should show `HA API self-test passed` followed by `Registry sync complete` and `Bot polling started (v2.3.2, mode=full)`.
+- [ ] **Normal startup**: Start the add-on when HA Core is already running. Logs should show `HA API self-test passed` followed by `Registry sync complete` and `Bot polling started (v2.3.3, mode=full)`.
 - [ ] **Start during HA boot**: Restart Home Assistant (Settings > System > Restart) and immediately start the add-on. Logs should show `HA not ready (attempt N/10)` messages, then either recovery or degraded mode.
 - [ ] **Degraded mode**: Stop HA Core, start the add-on. Confirm it shows `mode=degraded` in the startup log. Send `/start` to the bot — it should respond with the main menu (menus will show no devices until HA recovers).
 - [ ] **Auto-recovery**: With the bot running in degraded mode, start HA Core. Within 30 seconds, logs should show `HA API recovered` and `Recovery complete — full functionality restored`. Bot menus should now show devices.

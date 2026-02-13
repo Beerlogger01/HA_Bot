@@ -106,6 +106,7 @@ class Config:
     light_entity_id: str
     vacuum_entity_id: str
     goodnight_scene_id: str
+    radio_stations: tuple[dict[str, str], ...]
 
 
 def _coerce_user_ids(raw: Any) -> list[int]:
@@ -228,6 +229,22 @@ def _load_and_validate_config() -> tuple[Config, str]:
         vac_rooms_raw = ["bathroom", "kitchen", "living_room", "bedroom"]
     vac_rooms = tuple(r for r in vac_rooms_raw if isinstance(r, str) and r.strip())
 
+    # -- radio stations --
+    default_radio: list[dict[str, str]] = [
+        {"name": "Lounge FM", "url": "https://cast.loungefm.com.ua/lounge"},
+        {"name": "Radio Record", "url": "https://radiorecord.hostingradio.ru/rr_main96.aacp"},
+        {"name": "Europa Plus", "url": "https://ep256.hostingradio.ru:8052/europaplus256.mp3"},
+    ]
+    radio_raw = raw.get("radio_stations", default_radio)
+    if not isinstance(radio_raw, list):
+        radio_raw = default_radio
+    radio_stations: list[dict[str, str]] = []
+    for item in radio_raw:
+        if isinstance(item, dict) and "name" in item and "url" in item:
+            radio_stations.append({"name": str(item["name"]), "url": str(item["url"])})
+    if not radio_stations:
+        radio_stations = default_radio
+
     # --- SUPERVISOR_TOKEN ---
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not supervisor_token:
@@ -251,6 +268,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
         light_entity_id=light,
         vacuum_entity_id=vacuum,
         goodnight_scene_id=scene,
+        radio_stations=tuple(radio_stations),
     )
     return config, supervisor_token
 
@@ -460,7 +478,7 @@ class TelegramBot:
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
 
         mode_label = "degraded" if not self._ha_ready else "full"
-        logger.info("Bot polling started (v2.3.2, mode=%s)", mode_label)
+        logger.info("Bot polling started (v2.3.3, mode=%s)", mode_label)
 
         await self._dp.start_polling(
             self._bot,

@@ -1,5 +1,5 @@
 name: "Home Assistant Telegram Bot"
-version: "2.3.2"
+version: "2.3.3"
 slug: ha_telegram_bot
 description: "Interactive Telegram bot with dynamic HA mirroring (floors/areas/devices), vacuum room targeting, Roborock routines, media player controls, full domain support, favorites with pinned items, notifications with completion events, search, snapshots, scheduler, diagnostics, role-based access control, and dynamic device discovery for Home Assistant"
 image: "ghcr.io/beerlogger01/ha-bot-ha-telegram-bot-{arch}"
@@ -50,6 +50,13 @@ options:
   light_entity_id: ""
   vacuum_entity_id: ""
   goodnight_scene_id: ""
+  radio_stations:
+    - name: "Lounge FM"
+      url: "https://cast.loungefm.com.ua/lounge"
+    - name: "Radio Record"
+      url: "https://radiorecord.hostingradio.ru/rr_main96.aacp"
+    - name: "Europa Plus"
+      url: "https://ep256.hostingradio.ru:8052/europaplus256.mp3"
 
 schema:
   bot_token: password
@@ -72,3 +79,6 @@ schema:
   light_entity_id: str?
   vacuum_entity_id: str?
   goodnight_scene_id: str?
+  radio_stations:
+    - name: str
+      url: str

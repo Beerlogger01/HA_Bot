@@ -28,6 +28,7 @@ from scheduler import Scheduler, next_cron_time, validate_cron
 from storage import Database
 from ui import (
     _ACTIVE_STATES,
+    COLOR_PRESETS,
     build_active_now_menu,
     build_areas_menu,
     build_confirmation,
@@ -38,11 +39,16 @@ from ui import (
     build_fav_actions_menu,
     build_favorites_menu,
     build_floors_menu,
+    build_global_color_menu,
+    build_global_color_result,
     build_help_menu,
+    build_light_color_menu,
     build_main_menu,
     build_media_source_menu,
     build_notif_list,
+    build_radio_menu,
     build_roles_list,
+    build_scenarios_menu,
     build_schedule_list,
     build_search_prompt,
     build_search_results,
@@ -51,6 +57,8 @@ from ui import (
     build_status_menu,
     build_vacuum_rooms,
     build_vacuum_routines,
+    group_sensor_entities,
+    sort_entities_for_device,
 )
 from vacuum_adapter import VacuumAdapter
 
@@ -80,6 +88,7 @@ _WRITE_PREFIXES: frozenset[str] = frozenset({
     "act", "bright", "clim", "fav", "ntog", "vseg", "vcmd", "rtn",
     "nact", "nmute", "fa_run", "fa_del", "schtog", "schdel", "snapdel",
     "mvol", "mmut", "msrs", "ssel", "nval", "pin",
+    "qsc", "lcs", "gcl", "rad", "rout",
 })
 
 
@@ -154,6 +163,10 @@ class Handlers:
 
         # In-memory search result cache: chat_id -> entity list
         self._search_cache: dict[int, list[dict[str, Any]]] = {}
+        # Navigation breadcrumb stack: chat_id -> [callback, ...]
+        self._nav_stack: dict[int, list[str]] = {}
+        # Radio state per chat: chat_id -> {station_idx, player_eid, playing}
+        self._radio_state: dict[int, dict[str, Any]] = {}
 
     # -----------------------------------------------------------------------
     # Security
@@ -250,6 +263,31 @@ class Handlers:
         return True
 
     # -----------------------------------------------------------------------
+    # Navigation breadcrumb stack
+    # -----------------------------------------------------------------------
+
+    def _push_nav(self, cid: int, cb: str) -> None:
+        """Push a callback onto the navigation stack for this chat."""
+        stack = self._nav_stack.setdefault(cid, [])
+        if not stack or stack[-1] != cb:
+            stack.append(cb)
+        if len(stack) > 20:
+            stack[:] = stack[-20:]
+
+    def _pop_nav(self, cid: int) -> str:
+        """Pop the navigation stack and return the previous callback."""
+        stack = self._nav_stack.get(cid, [])
+        if stack:
+            stack.pop()  # remove current
+        if stack:
+            return stack.pop()  # return previous
+        return "nav:main"
+
+    def _clear_nav(self, cid: int) -> None:
+        """Clear the navigation stack for this chat."""
+        self._nav_stack.pop(cid, None)
+
+    # -----------------------------------------------------------------------
     # Commands
     # -----------------------------------------------------------------------
 
@@ -265,6 +303,7 @@ class Handlers:
             return
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="/start", success=True)
+        self._clear_nav(cid)
         text, kb = build_main_menu()
         tid = self._get_thread_id(message)
         await self._send_or_edit(cid, text, kb, source=message, menu="main", thread_id=tid)
@@ -603,12 +642,30 @@ class Handlers:
         target = data.split(":", 1)[1] if ":" in data else "main"
         await cb.answer()
         if target == "main":
+            self._clear_nav(cid)
             t, k = build_main_menu()
             await self._send_or_edit(cid, t, k, menu="main")
-        elif target == "manage":
+        elif target == "manage" or target == "devices":
             await self._show_manage(cid)
         elif target == "floors":
             await self._show_floors(cid)
+        elif target == "back":
+            # Breadcrumb: pop the stack and navigate to previous
+            prev = self._pop_nav(cid)
+            # Re-dispatch the previous callback
+            if prev == "nav:main":
+                self._clear_nav(cid)
+                t, k = build_main_menu()
+                await self._send_or_edit(cid, t, k, menu="main")
+            else:
+                # Simulate the callback by re-dispatching
+                prefix = prev.split(":", 1)[0] if ":" in prev else prev
+                handler = self._ROUTES.get(prefix)
+                if handler:
+                    await handler(self, cid, uid, uname, prev, cb)
+                else:
+                    t, k = build_main_menu()
+                    await self._send_or_edit(cid, t, k, menu="main")
         else:
             t, k = build_main_menu()
             await self._send_or_edit(cid, t, k, menu="main")
@@ -621,9 +678,14 @@ class Handlers:
         target = data.split(":", 1)[1] if ":" in data else ""
         await cb.answer()
 
-        if target == "manage":
+        if target == "manage" or target == "devices":
+            self._push_nav(cid, "nav:main")
             await self._show_manage(cid)
+        elif target == "scenarios":
+            self._push_nav(cid, "nav:main")
+            await self._show_scenarios(cid)
         elif target == "favorites":
+            self._push_nav(cid, "nav:main")
             await self._show_favorites(cid, uid, 0)
         elif target == "fav_actions":
             await self._show_fav_actions(cid, uid, 0)
@@ -654,7 +716,15 @@ class Handlers:
             t, k = build_help_menu()
             await self._send_or_edit(cid, t, k, menu="help")
         elif target == "active":
+            self._push_nav(cid, "nav:main")
             await self._show_active_now(cid, uid, 0)
+        elif target == "radio":
+            self._push_nav(cid, "nav:main")
+            await self._show_radio(cid)
+        elif target == "gcolor":
+            self._push_nav(cid, "nav:main")
+            t, k = build_global_color_menu()
+            await self._send_or_edit(cid, t, k, menu="gcolor")
 
     # -----------------------------------------------------------------------
     # fl: — floor selected
@@ -701,6 +771,7 @@ class Handlers:
     async def _area(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
         area_id = data.split(":", 1)[1] if ":" in data else ""
         await cb.answer()
+        self._push_nav(cid, "nav:manage")
 
         domains = frozenset(self._cfg.menu_domains_allowlist)
         sa = self._cfg.show_all_enabled
@@ -722,6 +793,19 @@ class Handlers:
             await self._show_entity_control(cid, uid, devices[0]["primary_entity_id"])
             return
 
+        # Collect quick scenes for this area (scene/script entities)
+        quick_scenes: list[dict[str, Any]] = []
+        if area_id and area_id != "__none__":
+            area_obj = self._reg.areas.get(area_id)
+            if area_obj:
+                for eid in area_obj.entity_ids:
+                    d = eid.split(".", 1)[0]
+                    if d in ("scene", "script"):
+                        ent_info = self._reg.entities.get(eid)
+                        if ent_info and not ent_info.disabled_by:
+                            name = ent_info.name or ent_info.original_name or eid
+                            quick_scenes.append({"entity_id": eid, "friendly_name": name})
+
         pin_btn = None
         if area_id and area_id != "__none__":
             is_pinned = await self._db.is_pinned(uid, "area", area_id)
@@ -733,6 +817,7 @@ class Handlers:
             title=title, back_cb="nav:manage",
             page_cb_prefix=f"arp:{area_id}",
             pin_btn=pin_btn,
+            scenes=quick_scenes if quick_scenes else None,
         )
         await self._send_or_edit(cid, t, k, menu=f"area:{area_id}")
 
@@ -872,7 +957,11 @@ class Handlers:
         await self._send_or_edit(cid, t, k, menu=f"device:{device_id}:{page}")
 
     async def _show_entity_control(self, cid: int, uid: int, eid: str) -> None:
-        state = await self._ha.get_state(eid)
+        try:
+            state = await self._ha.get_state(eid)
+        except Exception:
+            logger.exception("Failed to fetch state for %s", eid)
+            state = None
         if state is None:
             t, k = build_confirmation("\U0001f534 Сущность не найдена.", "nav:main")
             await self._send_or_edit(cid, t, k, menu="entity_err")
@@ -889,23 +978,44 @@ class Handlers:
         else:
             back = "nav:manage"
 
+        self._push_nav(cid, back)
+
         t, k = build_entity_control(eid, state, is_fav, is_notif, back)
 
-        # For vacuum, add extra buttons (rooms, routines)
         domain = eid.split(".", 1)[0]
+
+        # For lights that support color, add color preset button
+        if domain == "light":
+            attrs = state.get("attributes", {})
+            color_modes = attrs.get("supported_color_modes", [])
+            if any(m in ("rgb", "rgbw", "rgbww", "hs", "xy") for m in color_modes):
+                rows = k.inline_keyboard[:]
+                insert_pos = max(0, len(rows) - 2)
+                rows.insert(insert_pos, [InlineKeyboardButton(
+                    text="\U0001f3a8 Цвет",
+                    callback_data=f"lclr:{eid}",
+                )])
+                k = InlineKeyboardMarkup(inline_keyboard=rows)
+
+        # For vacuum, add extra buttons (rooms, routines)
         if domain == "vacuum":
             extra_rows: list[list[InlineKeyboardButton]] = []
-            caps = await self._vac.get_capabilities(eid)
-            if caps.supports_segment_clean:
-                extra_rows.append([InlineKeyboardButton(
-                    text="\U0001f3e0 Уборка по комнатам",
-                    callback_data=f"vrooms:{eid}",
-                )])
-            if caps.supports_routines:
-                extra_rows.append([InlineKeyboardButton(
-                    text=f"\U0001f3ac Сценарии ({caps.routine_count})",
-                    callback_data=f"vrtn:{eid}",
-                )])
+            try:
+                caps = await self._vac.get_capabilities(eid)
+            except Exception:
+                logger.exception("Failed to get vacuum capabilities for %s", eid)
+                caps = None
+            if caps:
+                if caps.supports_segment_clean:
+                    extra_rows.append([InlineKeyboardButton(
+                        text="\U0001f3e0 Уборка по комнатам",
+                        callback_data=f"vrooms:{eid}",
+                    )])
+                if caps.supports_routines:
+                    extra_rows.append([InlineKeyboardButton(
+                        text=f"\U0001f3ac Сценарии ({caps.routine_count})",
+                        callback_data=f"vrtn:{eid}",
+                    )])
             if extra_rows:
                 rows = k.inline_keyboard[:]
                 insert_pos = max(0, len(rows) - 2)
@@ -938,7 +1048,11 @@ class Handlers:
             return
 
         await cb.answer("\u2699\ufe0f Выполняю...")
-        ok, err = await self._ha.call_service(domain, service, {"entity_id": eid})
+        try:
+            ok, err = await self._ha.call_service(domain, service, {"entity_id": eid})
+        except Exception as exc:
+            logger.exception("Service call %s.%s failed for %s", domain, service, eid)
+            ok, err = False, str(exc)[:200]
         if ok:
             self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
@@ -1311,7 +1425,11 @@ class Handlers:
             return
 
         await cb.answer("\u2699\ufe0f Выполняю...")
-        ok, err = await self._ha.call_service(domain, service, {"entity_id": eid})
+        try:
+            ok, err = await self._ha.call_service(domain, service, {"entity_id": eid})
+        except Exception as exc:
+            logger.exception("Notification action %s.%s failed for %s", domain, service, eid)
+            ok, err = False, str(exc)[:200]
         if ok:
             self._rl.record()
             await cb.answer(f"\u2705 {service}", show_alert=False)
@@ -1823,10 +1941,15 @@ class Handlers:
         await self._send_or_edit(cid, t, k, menu="favorites")
 
     async def _show_active_now(self, cid: int, uid: int, page: int) -> None:
-        """Show all entities that are currently in an active state."""
+        """Show all entities that are currently in an active state, deduplicated by device."""
         domains = frozenset(self._cfg.menu_domains_allowlist)
-        all_states = await self._ha.list_states()
+        try:
+            all_states = await self._ha.list_states()
+        except Exception:
+            logger.exception("Failed to fetch states for Active Now")
+            all_states = []
         active: list[dict[str, Any]] = []
+        seen_devices: set[str] = set()
         for s in all_states:
             eid = s.get("entity_id", "")
             if not eid:
@@ -1836,6 +1959,13 @@ class Handlers:
                 continue
             state_val = s.get("state", "")
             if state_val in _ACTIVE_STATES:
+                # Device deduplication: group by device_id, show primary entity
+                ent_info = self._reg.entities.get(eid)
+                dev_id = ent_info.device_id if ent_info and ent_info.device_id else None
+                if dev_id:
+                    if dev_id in seen_devices:
+                        continue
+                    seen_devices.add(dev_id)
                 fname = s.get("attributes", {}).get("friendly_name", eid)
                 active.append({
                     "entity_id": eid,
@@ -1868,15 +1998,33 @@ class Handlers:
     async def _do_refresh(self, cid: int) -> None:
         t, k = build_confirmation("\U0001f504 Синхронизация с Home Assistant...", "nav:main")
         await self._send_or_edit(cid, t, k, menu="refreshing")
-        ok = await self._reg.sync()
+        try:
+            ok = await self._reg.sync()
+        except Exception:
+            logger.exception("Registry sync error during refresh")
+            ok = False
         if ok:
-            msg = (
-                f"\u2705 Синхронизация завершена!\n\n"
-                f"Этажей: {len(self._reg.floors)}\n"
-                f"Комнат: {len(self._reg.areas)}\n"
-                f"Устройств: {len(self._reg.devices)}\n"
-                f"Сущностей: {len(self._reg.entities)}"
-            )
+            # Friendly summary with counts
+            nf = len(self._reg.floors)
+            na = len(self._reg.areas)
+            nd = len(self._reg.devices)
+            ne = len(self._reg.entities)
+            vac_count = sum(1 for e in self._reg.entities if e.startswith("vacuum."))
+            lines = [
+                "\u2705 <b>Синхронизация завершена!</b>",
+                "",
+                f"\U0001f3e2 Этажей: <b>{nf}</b>",
+                f"\U0001f3e0 Комнат: <b>{na}</b>",
+                f"\U0001f4f1 Устройств: <b>{nd}</b>",
+                f"\U0001f50c Сущностей: <b>{ne}</b>",
+            ]
+            if vac_count:
+                lines.append(f"\U0001f9f9 Пылесосов: <b>{vac_count}</b>")
+            for vac_eid, btns in self._reg.vacuum_routines.items():
+                if btns:
+                    vname = self._reg.get_entity_display_name(vac_eid)
+                    lines.append(f"  \u2514 {vname}: {len(btns)} сценариев")
+            msg = "\n".join(lines)
         else:
             msg = "\u274c Ошибка синхронизации. Проверьте логи."
         t, k = build_confirmation(msg, "nav:main")
@@ -1954,6 +2102,285 @@ class Handlers:
     # Route table (prefix -> handler)
     # -----------------------------------------------------------------------
 
+    # -----------------------------------------------------------------------
+    # Scenarios menu (unassigned scene/script entities)
+    # -----------------------------------------------------------------------
+
+    async def _show_scenarios(self, cid: int, page: int = 0) -> None:
+        """Show all scene and script entities grouped as scenarios."""
+        scenarios: list[dict[str, Any]] = []
+        for eid, ent in self._reg.entities.items():
+            if ent.disabled_by:
+                continue
+            domain = eid.split(".", 1)[0]
+            if domain in ("scene", "script"):
+                name = ent.name or ent.original_name or eid
+                scenarios.append({"entity_id": eid, "friendly_name": name, "domain": domain})
+        scenarios.sort(key=lambda x: x["friendly_name"].lower())
+        t, k = build_scenarios_menu(scenarios, page, self._cfg.menu_page_size)
+        await self._send_or_edit(cid, t, k, menu="scenarios")
+
+    async def _scenario_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":")
+        page = int(parts[1]) if len(parts) > 1 else 0
+        await cb.answer()
+        await self._show_scenarios(cid, page)
+
+    # -----------------------------------------------------------------------
+    # Quick scene activation (qsc:entity_id)
+    # -----------------------------------------------------------------------
+
+    async def _quick_scene(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        _, eid = data.split(":", 1) if ":" in data else ("", "")
+        if not eid:
+            await cb.answer("\u274c Не найден сценарий")
+            return
+        domain = eid.split(".", 1)[0]
+        try:
+            ok, _err = await self._ha.call_service(domain, "turn_on", {"entity_id": eid})
+        except Exception:
+            logger.exception("Quick scene call failed for %s", eid)
+            ok = False
+        if ok:
+            fname = self._reg.get_entity_display_name(eid)
+            await cb.answer(f"\u2705 {fname}")
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action="quick_scene", entity_id=eid, success=True)
+        else:
+            await cb.answer("\u274c Ошибка вызова", show_alert=True)
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action="quick_scene", entity_id=eid, success=False, error="call failed")
+
+    # -----------------------------------------------------------------------
+    # Light color presets (lclr:entity_id, lcs:entity_id:color_name)
+    # -----------------------------------------------------------------------
+
+    async def _light_color_menu(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        _, eid = data.split(":", 1) if ":" in data else ("", "")
+        await cb.answer()
+        if not eid:
+            return
+        fname = self._reg.get_entity_display_name(eid)
+        back_cb = f"ent:{eid}"
+        t, k = build_light_color_menu(eid, fname, back_cb)
+        await self._send_or_edit(cid, t, k, menu=f"lclr:{eid}")
+
+    async def _light_color_set(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":")
+        if len(parts) < 3:
+            await cb.answer("\u274c Неверный формат")
+            return
+        eid = parts[1]
+        try:
+            color_idx = int(parts[2])
+        except ValueError:
+            await cb.answer("\u274c Неверный индекс цвета")
+            return
+        if color_idx < 0 or color_idx >= len(COLOR_PRESETS):
+            await cb.answer("\u274c Цвет не найден")
+            return
+        label, rgb = COLOR_PRESETS[color_idx]
+        try:
+            ok, _err = await self._ha.call_service(
+                "light", "turn_on",
+                {"entity_id": eid, "rgb_color": list(rgb)},
+            )
+        except Exception:
+            logger.exception("Light color set failed for %s", eid)
+            ok = False
+        if ok:
+            await cb.answer(f"\u2705 {label}")
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action="light_color", entity_id=eid, success=True)
+        else:
+            await cb.answer("\u274c Ошибка", show_alert=True)
+        # Refresh entity control
+        await self._show_entity_control(cid, uid, eid)
+
+    # -----------------------------------------------------------------------
+    # Global color scenes (gcl:color_name)
+    # -----------------------------------------------------------------------
+
+    async def _global_color(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":")
+        try:
+            color_idx = int(parts[1]) if len(parts) > 1 else -1
+        except ValueError:
+            color_idx = -1
+        if color_idx < 0 or color_idx >= len(COLOR_PRESETS):
+            await cb.answer("\u274c Цвет не найден")
+            return
+        label, rgb = COLOR_PRESETS[color_idx]
+
+        # Find all light entities that support color (rgb)
+        try:
+            all_states = await self._ha.list_states()
+        except Exception:
+            logger.exception("Failed to fetch states for global color")
+            await cb.answer("\u274c Ошибка получения состояний", show_alert=True)
+            return
+
+        count = 0
+        for s in all_states:
+            eid = s.get("entity_id", "")
+            if not eid.startswith("light."):
+                continue
+            attrs = s.get("attributes", {})
+            color_modes = attrs.get("supported_color_modes", [])
+            if any(m in ("rgb", "rgbw", "rgbww", "hs", "xy") for m in color_modes):
+                try:
+                    ok, _err = await self._ha.call_service(
+                        "light", "turn_on",
+                        {"entity_id": eid, "rgb_color": list(rgb)},
+                    )
+                    if ok:
+                        count += 1
+                except Exception:
+                    logger.warning("Failed to set color on %s", eid)
+
+        await cb.answer(f"\u2705 {label} — {count} ламп")
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action="global_color", entity_id=label, success=True)
+        t, k = build_global_color_result(label, count)
+        await self._send_or_edit(cid, t, k, menu="gcolor_result")
+
+    # -----------------------------------------------------------------------
+    # Radio controls (rad:action, rout:entity_id)
+    # -----------------------------------------------------------------------
+
+    async def _show_radio(self, cid: int) -> None:
+        """Show radio menu with current state."""
+        state = self._radio_state.get(cid, {})
+        # Find available media_player entities
+        players: list[dict[str, Any]] = []
+        try:
+            all_states = await self._ha.list_states()
+        except Exception:
+            logger.exception("Failed to fetch states for radio")
+            all_states = []
+        for s in all_states:
+            eid = s.get("entity_id", "")
+            if eid.startswith("media_player."):
+                fname = s.get("attributes", {}).get("friendly_name", eid)
+                players.append({"entity_id": eid, "friendly_name": fname})
+
+        # Get configured stations from config
+        stations = list(self._cfg.radio_stations)
+
+        current_station = state.get("station_idx", 0)
+        current_player = state.get("player_eid", "")
+        is_playing = state.get("playing", False)
+
+        t, k = build_radio_menu(
+            stations=stations,
+            players=players,
+            current_station_idx=current_station,
+            current_player=current_player,
+            is_playing=is_playing,
+        )
+        await self._send_or_edit(cid, t, k, menu="radio")
+
+    async def _radio_control(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        state = self._radio_state.setdefault(cid, {"station_idx": 0, "player_eid": "", "playing": False})
+
+        stations = list(self._cfg.radio_stations)
+
+        if action == "play":
+            player = state.get("player_eid", "")
+            if not player:
+                await cb.answer("\u26a0 Выберите устройство вывода", show_alert=True)
+                return
+            idx = state.get("station_idx", 0)
+            if idx < len(stations):
+                station = stations[idx]
+                try:
+                    ok, _err = await self._ha.call_service(
+                        "media_player", "play_media",
+                        {
+                            "entity_id": player,
+                            "media_content_id": station["url"],
+                            "media_content_type": "music",
+                        },
+                    )
+                except Exception:
+                    logger.exception("Radio play failed")
+                    ok = False
+                if ok:
+                    state["playing"] = True
+                    await cb.answer(f"\u25b6 {station['name']}")
+                    await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                                 action="radio_play", entity_id=player, success=True)
+                else:
+                    await cb.answer("\u274c Ошибка воспроизведения", show_alert=True)
+            await self._show_radio(cid)
+
+        elif action == "stop":
+            player = state.get("player_eid", "")
+            if player:
+                try:
+                    await self._ha.call_service("media_player", "media_stop", {"entity_id": player})
+                except Exception:
+                    logger.warning("Radio stop failed for %s", player)
+            state["playing"] = False
+            await cb.answer("\u23f9 Остановлено")
+            await self._show_radio(cid)
+
+        elif action == "next":
+            idx = state.get("station_idx", 0)
+            state["station_idx"] = (idx + 1) % max(len(stations), 1)
+            await cb.answer()
+            if state.get("playing"):
+                # Auto-play next station
+                new_idx = state["station_idx"]
+                player = state.get("player_eid", "")
+                if player and new_idx < len(stations):
+                    try:
+                        await self._ha.call_service(
+                            "media_player", "play_media",
+                            {
+                                "entity_id": player,
+                                "media_content_id": stations[new_idx]["url"],
+                                "media_content_type": "music",
+                            },
+                        )
+                    except Exception:
+                        pass
+            await self._show_radio(cid)
+
+        elif action == "prev":
+            idx = state.get("station_idx", 0)
+            state["station_idx"] = (idx - 1) % max(len(stations), 1)
+            await cb.answer()
+            if state.get("playing"):
+                new_idx = state["station_idx"]
+                player = state.get("player_eid", "")
+                if player and new_idx < len(stations):
+                    try:
+                        await self._ha.call_service(
+                            "media_player", "play_media",
+                            {
+                                "entity_id": player,
+                                "media_content_id": stations[new_idx]["url"],
+                                "media_content_type": "music",
+                            },
+                        )
+                    except Exception:
+                        pass
+            await self._show_radio(cid)
+        else:
+            await cb.answer()
+
+    async def _radio_output(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":", 1)
+        player_eid = parts[1] if len(parts) > 1 else ""
+        state = self._radio_state.setdefault(cid, {"station_idx": 0, "player_eid": "", "playing": False})
+        state["player_eid"] = player_eid
+        fname = self._reg.get_entity_display_name(player_eid)
+        await cb.answer(f"\U0001f50a {fname}")
+        await self._show_radio(cid)
+
     _ROUTES: dict[str, Any] = {
         "nav": _nav,
         "menu": _menu,
@@ -1996,4 +2423,12 @@ class Handlers:
         "vcmd": _vac_cmd,
         "vrtn": _vac_routines,
         "rtn": _routine_press,
+        # New routes
+        "qsc": _quick_scene,
+        "lclr": _light_color_menu,
+        "lcs": _light_color_set,
+        "gcl": _global_color,
+        "rad": _radio_control,
+        "rout": _radio_output,
+        "scp": _scenario_page,
     }

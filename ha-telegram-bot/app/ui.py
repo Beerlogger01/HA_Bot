@@ -4,14 +4,12 @@ All builders return (text, InlineKeyboardMarkup) tuples.
 Callback data format: "prefix:payload" (max 64 bytes per Telegram limit).
 
 Menu tree:
-  Main -> Управление -> (Floors?) -> Areas -> Entities -> Controls
-  Main -> Избранное -> Entities -> Controls
-  Main -> Избранное -> Быстрые действия
-  Main -> Уведомления -> Entities -> toggle/mode
-  Main -> Обновить / Статус
-  Main -> Расписание -> list/add/toggle/delete
-  Main -> Поиск -> results -> entity controls
-  Main -> Диагностика -> health/debug/trace
+  Main -> Devices -> (Floors?) -> Areas -> Entities -> Controls
+  Main -> Scenarios -> Scenes/Scripts/Automations -> Controls
+  Main -> Active -> Entity -> Controls
+  Main -> Radio -> Station -> Output device -> Controls
+  Main -> Global Light Scenes -> Color picker
+  Main -> Status / Update-SYNC
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 DOMAIN_ICONS: dict[str, str] = {
     "light": "\U0001f4a1",
     "switch": "\U0001f50c",
-    "vacuum": "\U0001f916",
+    "vacuum": "\U0001f9f9",
     "scene": "\U0001f3ac",
     "script": "\u25b6\ufe0f",
     "climate": "\U0001f321\ufe0f",
@@ -38,7 +36,7 @@ DOMAIN_ICONS: dict[str, str] = {
     "binary_sensor": "\U0001f534",
     "automation": "\u2699\ufe0f",
     "input_boolean": "\U0001f518",
-    "media_player": "\U0001f3b5",
+    "media_player": "\U0001f4fa",
     "camera": "\U0001f4f7",
     "lock": "\U0001f512",
     "number": "\U0001f522",
@@ -66,6 +64,17 @@ DOMAIN_LABELS: dict[str, str] = {
     "water_heater": "Водонагреватели",
 }
 
+# Color presets: (label, rgb_color)
+COLOR_PRESETS: list[tuple[str, tuple[int, int, int]]] = [
+    ("\U0001f534 Красный", (255, 0, 0)),
+    ("\U0001f7e0 Оранжевый", (255, 165, 0)),
+    ("\U0001f7e1 Жёлтый", (255, 255, 0)),
+    ("\U0001f7e2 Зелёный", (0, 255, 0)),
+    ("\U0001f535 Синий", (0, 0, 255)),
+    ("\U0001f7e3 Фиолетовый", (128, 0, 255)),
+    ("\u26aa Тёплый белый", (255, 200, 120)),
+]
+
 
 def _sanitize(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -85,6 +94,11 @@ def _trunc(text: str, max_len: int = 28) -> str:
     return text[:max_len] if len(text) > max_len else text
 
 
+def _home_btn() -> InlineKeyboardButton:
+    """Home button to return to main menu."""
+    return InlineKeyboardButton(text="\U0001f3e0 Меню", callback_data="nav:main")
+
+
 # ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
@@ -96,18 +110,21 @@ def build_main_menu() -> tuple[str, InlineKeyboardMarkup]:
         "Выберите действие:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001f3db Управление", callback_data="menu:manage")],
         [
-            InlineKeyboardButton(text="\u2b50 Избранное", callback_data="menu:favorites"),
+            InlineKeyboardButton(text="\U0001f3db Устройства", callback_data="menu:devices"),
+            InlineKeyboardButton(text="\U0001f3ac Сценарии", callback_data="menu:scenarios"),
+        ],
+        [
             InlineKeyboardButton(text="\U0001f7e2 Активные", callback_data="menu:active"),
+            InlineKeyboardButton(text="\U0001f4fb Радио \U0001f1f7\U0001f1fa", callback_data="menu:radio"),
         ],
         [
-            InlineKeyboardButton(text="\U0001f514 Уведомления", callback_data="menu:notif"),
-            InlineKeyboardButton(text="\U0001f6e0 Диагностика", callback_data="menu:diag"),
+            InlineKeyboardButton(text="\U0001f3a8 Цвет света", callback_data="menu:gcolor"),
+            InlineKeyboardButton(text="\u2b50 Избранное", callback_data="menu:favorites"),
         ],
         [
-            InlineKeyboardButton(text="\U0001f50d Поиск", callback_data="menu:search"),
-            InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:refresh"),
+            InlineKeyboardButton(text="\u2139\ufe0f Статус", callback_data="menu:status"),
+            InlineKeyboardButton(text="\U0001f504 SYNC", callback_data="menu:refresh"),
         ],
     ])
     return text, kb
@@ -130,16 +147,64 @@ def build_active_now_menu(
         text = "\U0001f7e2 <b>Активные сейчас</b>\n\nВсё выключено."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:active")],
-            [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+            [_home_btn()],
         ])
         return text, kb
 
-    return build_entity_list(
+    return _build_active_entity_list(
         entities, page, page_size,
         title=f"\U0001f7e2 <b>Активные сейчас</b> ({len(entities)})",
         back_cb="nav:main",
         page_cb_prefix="actp",
     )
+
+
+def _build_active_entity_list(
+    entities: list[dict[str, Any]],
+    page: int,
+    page_size: int,
+    title: str,
+    back_cb: str,
+    page_cb_prefix: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Entity list for Active menu — uses dev: callback for device-grouped navigation."""
+    total = len(entities)
+    total_pages = max(1, math.ceil(total / page_size))
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    end = min(start + page_size, total)
+    page_ents = entities[start:end]
+
+    text = f"{title} (стр. {page + 1}/{total_pages})"
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for ent in page_ents:
+        eid = ent["entity_id"]
+        name = ent.get("friendly_name", eid)
+        state = ent.get("state", "")
+        domain = eid.split(".", 1)[0]
+        si = _state_icon(domain, state)
+        icon = DOMAIN_ICONS.get(domain, "")
+        # Use ent: callback to open entity detail (not close)
+        rows.append([InlineKeyboardButton(
+            text=f"{si}{icon} {_trunc(name)}",
+            callback_data=f"ent:{eid}",
+        )])
+
+    # Pagination
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="\u25c0", callback_data=f"{page_cb_prefix}:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="\u25b6", callback_data=f"{page_cb_prefix}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:active"),
+    ])
+    rows.append([_home_btn()])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +217,7 @@ def build_floors_menu(
     unassigned_count: int = 0,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """floors: [{"floor_id", "name", "area_count"}, ...]"""
-    text = "\U0001f3db <b>Пространства</b>\n\nВыберите этаж/пространство:"
+    text = "\U0001f3db <b>Устройства</b>\n\nВыберите этаж:"
     rows: list[list[InlineKeyboardButton]] = []
     for fl in floors:
         label = f"{fl['name']} ({fl['area_count']})"
@@ -161,10 +226,10 @@ def build_floors_menu(
         )])
     if unassigned_count > 0:
         rows.append([InlineKeyboardButton(
-            text=f"Без пространства ({unassigned_count})",
+            text=f"\U0001f4e6 Без комнаты ({unassigned_count})",
             callback_data="fl:__none__",
         )])
-    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -196,6 +261,7 @@ def build_areas_menu(
             callback_data="ar:__none__",
         )])
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_target)])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -221,7 +287,7 @@ def build_entity_list(
     end = min(start + page_size, total)
     page_ents = entities[start:end]
 
-    text = f"{title} (стр. {page + 1}/{total_pages})\n\nВыберите устройство:"
+    text = f"{title} (стр. {page + 1}/{total_pages})"
     rows: list[list[InlineKeyboardButton]] = []
 
     for ent in page_ents:
@@ -230,8 +296,9 @@ def build_entity_list(
         state = ent.get("state", "")
         domain = eid.split(".", 1)[0]
         si = _state_icon(domain, state)
+        icon = DOMAIN_ICONS.get(domain, "")
         rows.append([InlineKeyboardButton(
-            text=f"{si} {_trunc(name)}",
+            text=f"{si}{icon} {_trunc(name)}",
             callback_data=f"ent:{eid}",
         )])
 
@@ -245,6 +312,8 @@ def build_entity_list(
         rows.append(nav)
 
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)])
+    if back_cb != "nav:main":
+        rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -261,8 +330,11 @@ def build_device_list(
     back_cb: str,
     page_cb_prefix: str = "arp",
     pin_btn: InlineKeyboardButton | None = None,
+    scenes: list[dict[str, Any]] | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """devices: [{"device_id", "name", "entity_ids", "primary_entity_id", "primary_domain", "is_vacuum"}, ...]"""
+    """devices: [{"device_id", "name", "entity_ids", "primary_entity_id", "primary_domain", "is_vacuum"}, ...]
+    scenes: [{"entity_id", "friendly_name"}, ...] — quick scenes for this area
+    """
     total = len(devices)
     total_pages = max(1, math.ceil(total / page_size))
     page = max(0, min(page, total_pages - 1))
@@ -270,8 +342,22 @@ def build_device_list(
     end = min(start + page_size, total)
     page_devs = devices[start:end]
 
-    text = f"{title} (стр. {page + 1}/{total_pages})\n\nВыберите устройство:"
+    text = f"{title} (стр. {page + 1}/{total_pages})"
     rows: list[list[InlineKeyboardButton]] = []
+
+    # Quick scenes section (before devices, only on first page)
+    if scenes and page == 0:
+        for sc in scenes[:4]:
+            sc_eid = sc["entity_id"]
+            sc_name = sc.get("friendly_name", sc_eid)
+            sc_domain = sc_eid.split(".", 1)[0]
+            sc_icon = DOMAIN_ICONS.get(sc_domain, "\U0001f3ac")
+            cb = f"qsc:{sc_eid}"
+            if len(cb) <= 64:
+                rows.append([InlineKeyboardButton(
+                    text=f"{sc_icon} {_trunc(sc_name, 25)}",
+                    callback_data=cb,
+                )])
 
     for dev in page_devs:
         did = dev["device_id"]
@@ -301,6 +387,8 @@ def build_device_list(
         rows.append([pin_btn])
 
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)])
+    if back_cb != "nav:main":
+        rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -329,39 +417,45 @@ def build_entity_control(
         ct = attrs.get("current_temperature")
         tt = attrs.get("temperature")
         if ct is not None:
-            extra.append(f"Текущая: {ct}\u00b0")
+            extra.append(f"\U0001f321 Текущая: {ct}\u00b0")
         if tt is not None:
-            extra.append(f"Целевая: {tt}\u00b0")
+            extra.append(f"\U0001f3af Целевая: {tt}\u00b0")
     elif domain == "light":
         br = attrs.get("brightness")
         if br is not None:
-            extra.append(f"Яркость: {round(br / 255 * 100)}%")
+            extra.append(f"\U0001f506 Яркость: {round(br / 255 * 100)}%")
+        ct = attrs.get("color_temp")
+        if ct is not None:
+            extra.append(f"\U0001f321 Цвет. темп.: {ct}")
     elif domain == "vacuum":
         bat = attrs.get("battery_level")
         if bat is not None:
-            extra.append(f"Батарея: {bat}%")
+            extra.append(f"\U0001f50b Батарея: {bat}%")
         fs = attrs.get("fan_speed")
         if fs is not None:
-            extra.append(f"Мощность: {fs}")
+            extra.append(f"\U0001f32c Мощность: {fs}")
     elif domain == "cover":
         pos = attrs.get("current_position")
         if pos is not None:
-            extra.append(f"Позиция: {pos}%")
+            extra.append(f"\U0001f4cf Позиция: {pos}%")
     elif domain == "media_player":
         mt = attrs.get("media_title")
         if mt:
-            extra.append(f"Трек: {_sanitize(str(mt)[:60])}")
+            extra.append(f"\U0001f3b5 Трек: {_sanitize(str(mt)[:60])}")
         src = attrs.get("source")
         if src:
-            extra.append(f"Источник: {_sanitize(str(src)[:40])}")
+            extra.append(f"\U0001f4fb Источник: {_sanitize(str(src)[:40])}")
         vol = attrs.get("volume_level")
         if vol is not None:
-            extra.append(f"Громкость: {round(float(vol) * 100)}%")
+            extra.append(f"\U0001f50a Громкость: {round(float(vol) * 100)}%")
         muted = attrs.get("is_volume_muted")
         if muted:
-            extra.append("Звук выключен")
+            extra.append("\U0001f507 Звук выключен")
     elif domain == "sensor":
         unit = attrs.get("unit_of_measurement", "")
+        device_class = attrs.get("device_class", "")
+        if device_class:
+            extra.append(f"Тип: {_sanitize(str(device_class))}")
         if unit:
             extra.append(f"Ед. изм.: {_sanitize(str(unit))}")
     elif domain == "select":
@@ -380,9 +474,9 @@ def build_entity_control(
         ct = attrs.get("current_temperature")
         tt = attrs.get("temperature")
         if ct is not None:
-            extra.append(f"Текущая: {ct}\u00b0")
+            extra.append(f"\U0001f321 Текущая: {ct}\u00b0")
         if tt is not None:
-            extra.append(f"Целевая: {tt}\u00b0")
+            extra.append(f"\U0001f3af Целевая: {tt}\u00b0")
 
     if extra:
         text += "\n" + "\n".join(extra)
@@ -398,6 +492,8 @@ def build_entity_control(
     rows.append(util_row)
 
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)])
+    if back_cb != "nav:main":
+        rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -420,6 +516,15 @@ def _control_buttons(
                     InlineKeyboardButton(text="\U0001f505 \u2212", callback_data=f"bright:{entity_id}:down"),
                     InlineKeyboardButton(text="\U0001f506 +", callback_data=f"bright:{entity_id}:up"),
                 ])
+            # Color button for color-capable lights
+            has_color = any(
+                m in ("rgb", "rgbw", "rgbww", "hs", "xy") for m in supported
+            ) if supported else False
+            if has_color:
+                rows.append([InlineKeyboardButton(
+                    text="\U0001f3a8 Цвет",
+                    callback_data=f"lclr:{entity_id}",
+                )])
 
     elif domain == "cover":
         rows.append([
@@ -462,6 +567,10 @@ def _control_buttons(
         )])
 
     elif domain == "media_player":
+        rows.append([
+            InlineKeyboardButton(text="\U0001f7e2 ON", callback_data=f"act:{entity_id}:turn_on"),
+            InlineKeyboardButton(text="\u26aa OFF", callback_data=f"act:{entity_id}:turn_off"),
+        ])
         rows.append([
             InlineKeyboardButton(text="\u25b6 Play", callback_data=f"act:{entity_id}:media_play"),
             InlineKeyboardButton(text="\u23f8 Pause", callback_data=f"act:{entity_id}:media_pause"),
@@ -521,6 +630,154 @@ def _control_buttons(
 
 
 # ---------------------------------------------------------------------------
+# Light color picker
+# ---------------------------------------------------------------------------
+
+
+def build_light_color_menu(
+    entity_id: str,
+    name: str,
+    back_cb: str = "nav:main",
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Color preset picker for a single light."""
+    text = f"\U0001f3a8 <b>Цвет — {_sanitize(name)}</b>\n\nВыберите цвет:"
+    rows: list[list[InlineKeyboardButton]] = []
+
+    for i, (label, rgb) in enumerate(COLOR_PRESETS):
+        cb = f"lcs:{entity_id}:{i}"
+        if len(cb) <= 64:
+            rows.append([InlineKeyboardButton(text=label, callback_data=cb)])
+
+    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)])
+    if back_cb != "nav:main":
+        rows.append([_home_btn()])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# Global light color scenes
+# ---------------------------------------------------------------------------
+
+
+def build_global_color_menu() -> tuple[str, InlineKeyboardMarkup]:
+    """Color picker that applies to ALL lights globally."""
+    text = (
+        "\U0001f3a8 <b>Цвет света — Все комнаты</b>\n\n"
+        "Выберите цвет для всех ламп:"
+    )
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, (label, _rgb) in enumerate(COLOR_PRESETS):
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"gcl:{i}")])
+
+    rows.append([_home_btn()])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_global_color_result(
+    color_label: str, count: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Result after applying global color."""
+    text = f"\u2705 {color_label} применён к {count} светильникам"
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.append([InlineKeyboardButton(text="\U0001f3a8 Другой цвет", callback_data="menu:gcolor")])
+    rows.append([_home_btn()])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# Scenarios menu (scenes/scripts/automations without area)
+# ---------------------------------------------------------------------------
+
+
+def build_scenarios_menu(
+    scenes: list[dict[str, Any]],
+    page: int = 0,
+    page_size: int = 8,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build Scenarios menu for entities not assigned to rooms."""
+    if not scenes:
+        text = "\U0001f3ac <b>Сценарии</b>\n\nНет сценариев."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [_home_btn()],
+        ])
+        return text, kb
+
+    return build_entity_list(
+        scenes, page, page_size,
+        title=f"\U0001f3ac <b>Сценарии</b> ({len(scenes)})",
+        back_cb="nav:main",
+        page_cb_prefix="scp",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Radio menu
+# ---------------------------------------------------------------------------
+
+
+def build_radio_menu(
+    stations: list[dict[str, Any]],
+    current_idx: int = 0,
+    current_player: str | None = None,
+    players: list[dict[str, Any]] | None = None,
+    is_playing: bool = False,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Radio control menu."""
+    if not stations:
+        text = (
+            "\U0001f4fb <b>Радио \U0001f1f7\U0001f1fa</b>\n\n"
+            "Радио не настроено.\n\n"
+            "Добавьте станции в конфигурации add-on:\n"
+            "<code>radio_stations:</code>\n"
+            "<code>  - name: Station</code>\n"
+            "<code>    url: http://stream.url</code>\n\n"
+            "Или укажите <code>radio_entity_id</code> с entity_id select-сущности."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [_home_btn()],
+        ])
+        return text, kb
+
+    station = stations[current_idx] if current_idx < len(stations) else stations[0]
+    station_name = station.get("name", f"Станция {current_idx + 1}")
+    play_icon = "\u25b6" if not is_playing else "\u23f8"
+
+    text = (
+        f"\U0001f4fb <b>Радио \U0001f1f7\U0001f1fa</b>\n\n"
+        f"Станция: <b>{_sanitize(station_name)}</b> "
+        f"({current_idx + 1}/{len(stations)})"
+    )
+    if current_player:
+        text += f"\nВывод: <code>{_sanitize(current_player)}</code>"
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Transport controls
+    rows.append([
+        InlineKeyboardButton(text="\u23ee Пред.", callback_data="rad:prev"),
+        InlineKeyboardButton(text=f"{play_icon} Play", callback_data="rad:play"),
+        InlineKeyboardButton(text="\u23f9 Stop", callback_data="rad:stop"),
+        InlineKeyboardButton(text="\u23ed След.", callback_data="rad:next"),
+    ])
+
+    # Output device picker
+    if players:
+        for pl in players[:6]:
+            pl_eid = pl["entity_id"]
+            pl_name = pl.get("friendly_name", pl_eid)
+            marker = "\U0001f50a " if pl_eid == current_player else ""
+            cb = f"rout:{pl_eid}"
+            if len(cb) <= 64:
+                rows.append([InlineKeyboardButton(
+                    text=f"{marker}{_trunc(pl_name, 26)}",
+                    callback_data=cb,
+                )])
+
+    rows.append([_home_btn()])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
 # Vacuum extra menus
 # ---------------------------------------------------------------------------
 
@@ -532,12 +789,12 @@ def build_vacuum_rooms(
     selected_room: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """rooms: [{"segment_id": "16", "segment_name": "Kitchen"}, ...]"""
-    text = f"\U0001f916 <b>{_sanitize(name)}</b>\n\nВыберите комнату для уборки:"
+    text = f"\U0001f9f9 <b>{_sanitize(name)}</b>\n\nВыберите комнату для уборки:"
     if selected_room:
         for r in rooms:
             if r["segment_id"] == selected_room:
                 text = (
-                    f"\U0001f916 <b>{_sanitize(name)}</b>\n"
+                    f"\U0001f9f9 <b>{_sanitize(name)}</b>\n"
                     f"Комната: {_sanitize(r.get('segment_name', selected_room))}\n\n"
                     "Нажмите Старт для начала уборки."
                 )
@@ -567,6 +824,7 @@ def build_vacuum_rooms(
         InlineKeyboardButton(text="\U0001f3e0 Док", callback_data=f"vcmd:{entity_id}:return_to_base"),
     ])
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=f"ent:{entity_id}")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -591,6 +849,7 @@ def build_vacuum_routines(
         )])
 
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=f"ent:{entity_id}")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -619,6 +878,7 @@ def build_media_source_menu(
             )])
 
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=f"ent:{entity_id}")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -637,7 +897,7 @@ def build_favorites_menu(
     if not entities and not fav_actions and not pinned_items:
         text = "\u2b50 <b>Избранное</b>\n\nСписок пуст."
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+            [_home_btn()],
         ])
         return text, kb
 
@@ -675,7 +935,7 @@ def build_favorites_menu(
     )
     rows = k.inline_keyboard[:]
 
-    # Insert pinned items and action buttons before the Back button
+    # Insert pinned items and action buttons before the Back/Home buttons
     insert_pos = max(0, len(rows) - 1)
     for pr in pinned_rows:
         rows.insert(insert_pos, pr)
@@ -699,6 +959,7 @@ def build_fav_actions_menu(
         text += "Нет сохранённых действий."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\u2b05 Назад", callback_data="menu:favorites")],
+            [_home_btn()],
         ])
         return text, kb
 
@@ -734,6 +995,7 @@ def build_fav_actions_menu(
         rows.append(nav)
 
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="menu:favorites")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -752,7 +1014,7 @@ def build_notif_list(
     if not subs:
         text += "Нет подписок. Добавьте через карточку устройства."
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+            [_home_btn()],
         ])
         return text, kb
 
@@ -785,7 +1047,7 @@ def build_notif_list(
     if nav:
         rows.append(nav)
 
-    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -803,14 +1065,16 @@ def build_status_menu(entities: list[dict[str, Any]]) -> tuple[str, InlineKeyboa
             eid = ent.get("entity_id", "unknown")
             name = ent.get("attributes", {}).get("friendly_name", eid)
             state = ent.get("state", "unknown")
+            domain = eid.split(".", 1)[0]
+            icon = DOMAIN_ICONS.get(domain, "\u2022")
             unit = ent.get("attributes", {}).get("unit_of_measurement", "")
             unit_str = f" {_sanitize(str(unit))}" if unit else ""
-            lines.append(f"\u2022 {_sanitize(name)}: <code>{_sanitize(state)}{unit_str}</code>")
+            lines.append(f"{icon} {_sanitize(name)}: <code>{_sanitize(state)}{unit_str}</code>")
         text = "\n".join(lines)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:status")],
-        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+        [_home_btn()],
     ])
     return text, kb
 
@@ -827,7 +1091,7 @@ def build_search_prompt() -> tuple[str, InlineKeyboardMarkup]:
         "Или используйте: /search <i>запрос</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+        [_home_btn()],
     ])
     return text, kb
 
@@ -842,7 +1106,7 @@ def build_search_results(
     if not entities:
         text = f"\U0001f50d <b>Поиск:</b> {_sanitize(query)}\n\nНичего не найдено."
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+            [_home_btn()],
         ])
         return text, kb
 
@@ -882,7 +1146,7 @@ def build_snapshots_list(
             ),
         ])
 
-    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -904,6 +1168,7 @@ def build_snapshot_detail(
             callback_data=f"snapdiff:{snapshot['id']}",
         )],
         [InlineKeyboardButton(text="\u2b05 Назад", callback_data="menu:snapshots")],
+        [_home_btn()],
     ]
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -940,7 +1205,7 @@ def build_schedule_list(
             ),
         ])
 
-    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")])
+    rows.append([_home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -957,7 +1222,7 @@ def build_diagnostics_menu(
             InlineKeyboardButton(text="\U0001f504 Refresh", callback_data="diag:refresh"),
             InlineKeyboardButton(text="\U0001f534 Last Error", callback_data="diag:trace"),
         ],
-        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+        [_home_btn()],
     ]
     return diag_text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -978,7 +1243,7 @@ def build_roles_list(
             text += f"\u2022 <code>{r['user_id']}</code>: <b>{r['role']}</b>\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+        [_home_btn()],
     ])
     return text, kb
 
@@ -992,10 +1257,12 @@ def build_confirmation(
     message: str,
     back_cb: str = "nav:main",
 ) -> tuple[str, InlineKeyboardMarkup]:
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)],
-    ])
-    return message, kb
+    ]
+    if back_cb != "nav:main":
+        rows.append([_home_btn()])
+    return message, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1020,14 +1287,85 @@ def build_help_menu() -> tuple[str, InlineKeyboardMarkup]:
         "/role \u2014 Управление ролями (admin)\n"
         "/export_settings \u2014 Экспорт настроек\n\n"
         "<b>Навигация:</b>\n"
-        "\u2022 <b>Управление</b> \u2014 Пространства \u2192 Комнаты \u2192 Устройства \u2192 Функции\n"
-        "\u2022 <b>Избранное</b> \u2014 Быстрый доступ к часто используемым\n"
-        "\u2022 <b>Уведомления</b> \u2014 Подписки на изменения состояний\n"
-        "\u2022 <b>Поиск</b> \u2014 Быстрый поиск по имени\n"
-        "\u2022 <b>Расписание</b> \u2014 Периодические действия\n\n"
+        "\u2022 <b>Устройства</b> \u2014 Комнаты \u2192 Устройства \u2192 Управление\n"
+        "\u2022 <b>Сценарии</b> \u2014 Сцены/скрипты без привязки к комнате\n"
+        "\u2022 <b>Активные</b> \u2014 Все включённые устройства\n"
+        "\u2022 <b>Радио</b> \u2014 Радиостанции\n"
+        "\u2022 <b>Цвет света</b> \u2014 Глобальные цветовые сцены\n"
+        "\u2022 <b>Избранное</b> \u2014 Быстрый доступ\n\n"
         "Все меню обновляются в одном сообщении."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="nav:main")],
+        [_home_btn()],
     ])
     return text, kb
+
+
+# ---------------------------------------------------------------------------
+# Sorted device detail — actions first, scenarios, then read-only
+# ---------------------------------------------------------------------------
+
+
+def sort_entities_for_device(
+    entities: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sort entities: actionable first, then scenes/scripts, then read-only sensors."""
+    action_domains = frozenset({
+        "light", "switch", "fan", "cover", "vacuum", "climate", "lock",
+        "media_player", "button", "input_boolean", "water_heater", "number", "select",
+    })
+    scenario_domains = frozenset({"scene", "script", "automation"})
+    read_only_domains = frozenset({"sensor", "binary_sensor"})
+
+    def sort_key(ent: dict[str, Any]) -> tuple[int, str]:
+        domain = ent.get("domain", ent["entity_id"].split(".", 1)[0])
+        if domain in action_domains:
+            return (0, ent.get("friendly_name", ent["entity_id"]))
+        elif domain in scenario_domains:
+            return (1, ent.get("friendly_name", ent["entity_id"]))
+        elif domain in read_only_domains:
+            return (2, ent.get("friendly_name", ent["entity_id"]))
+        return (3, ent.get("friendly_name", ent["entity_id"]))
+
+    return sorted(entities, key=sort_key)
+
+
+def group_sensor_entities(
+    entities: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Group similar sensor entities to reduce clutter.
+
+    For devices with many sensors (e.g., teapot with multiple temp readings),
+    prefer the primary sensor by device_class and deduplicate by unit.
+    """
+    sensors: list[dict[str, Any]] = []
+    non_sensors: list[dict[str, Any]] = []
+
+    for ent in entities:
+        domain = ent.get("domain", ent["entity_id"].split(".", 1)[0])
+        if domain in ("sensor", "binary_sensor"):
+            sensors.append(ent)
+        else:
+            non_sensors.append(ent)
+
+    if len(sensors) <= 3:
+        return non_sensors + sensors
+
+    # Group sensors by device_class or unit
+    seen_classes: dict[str, dict[str, Any]] = {}
+    remaining: list[dict[str, Any]] = []
+
+    for s in sensors:
+        attrs = s.get("attributes", {})
+        dc = attrs.get("device_class", "")
+        unit = attrs.get("unit_of_measurement", "")
+        key = f"{dc}|{unit}" if dc else ""
+
+        if key and key in seen_classes:
+            # Skip duplicate-class sensor, keep the first one
+            continue
+        if key:
+            seen_classes[key] = s
+        remaining.append(s)
+
+    return non_sensors + remaining

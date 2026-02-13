@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.3.3
+
+- **Devices / Scenarios split** — main menu now separates physical Devices from Scenes/Scripts
+- **Active Now** — device deduplication by device_id; tapping opens entity detail
+- **Quick Room Scenes** — scene/script entities appear at top of room device list
+- **Light color presets** — 7 color presets (Red, Orange, Yellow, Green, Blue, Purple, Warm White) on color-capable lights
+- **Global Light Color** — apply a color preset to ALL lights at once from main menu
+- **Radio menu** — stream internet radio to any media_player, with station switching and output selection
+- **Breadcrumb navigation** — Back button uses per-chat stack instead of hardcoded targets
+- **Home button** — 🏠 Меню button on all non-root submenus for instant return
+- **Improved SYNC** — refresh shows friendly summary with floor/area/device/entity counts and vacuum stats
+- **Error hardening** — try/except around all HA API calls in handlers, graceful fallback on failure
+- **Menu readability** — icons on main menu items, compact formatting
+- **Radio config** — `radio_stations` option in config.yaml for custom station list
+- Version bump to 2.3.3
+
 ## 2.3.2
 
 - **Resilient startup** — readiness gating with exponential backoff waits for HA Core to become available (handles 502 during boot)
