@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.3.6
+## 2.3.7
 
 - **Radio fix** — fixed TypeError crash when opening Radio menu (parameter name mismatch `current_station_idx` vs `current_idx`)
 - **Status screen** — when no `status_entities` configured, now shows currently active entities instead of "no entities to display"; shows domain summary when nothing is active
@@ -13,7 +13,7 @@
 - **Doorbell error handling** — explicit error message and logging on button.press failures; never silently ignores
 - **Registry logging** — added cross-ref assignment counts and primary entity selection debug logging
 - **Config** — added `terminal_enabled` (bool, default false) option
-- Version bump to 2.3.6
+- Version bump to 2.3.7
 
 ## 2.3.4
 
