@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.6
+
+- **Radio fix** — fixed TypeError crash when opening Radio menu (parameter name mismatch `current_station_idx` vs `current_idx`)
+- **Status screen** — when no `status_entities` configured, now shows currently active entities instead of "no entities to display"; shows domain summary when nothing is active
+- **Sync screen** — removed vacuum-only section from sync results; shows general registry counts only
+- **DND entity deprioritization** — audio devices no longer pick DND/mute entities as primary control; added `_DND_SUFFIXES` penalty in entity selection
+- **Notifications button restored** — re-added to main menu with correct `menu:notif` callback
+- **Automations screen** — new menu to list, enable/disable, and trigger HA automations
+- **To-Do lists** — new menu to browse HA to-do lists, view/add/complete/delete items
+- **/terminal command** — execute shell commands in the add-on container (admin only, disabled by default via `terminal_enabled` config)
+- **Doorbell error handling** — explicit error message and logging on button.press failures; never silently ignores
+- **Registry logging** — added cross-ref assignment counts and primary entity selection debug logging
+- **Config** — added `terminal_enabled` (bool, default false) option
+- Version bump to 2.3.6
+
 ## 2.3.4
 
 - **Per-action rate limit overrides** — `cooldown_seconds_default` (float) + `cooldown_overrides` dict for fine-grained control; defaults 0.2s for brightness/volume, backward-compatible with old `cooldown_seconds`

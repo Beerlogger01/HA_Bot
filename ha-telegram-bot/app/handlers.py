@@ -32,6 +32,7 @@ from ui import (
     COLOR_PRESETS,
     build_active_now_menu,
     build_areas_menu,
+    build_automations_menu,
     build_confirmation,
     build_device_list,
     build_diagnostics_menu,
@@ -56,6 +57,8 @@ from ui import (
     build_snapshot_detail,
     build_snapshots_list,
     build_status_menu,
+    build_todo_items_menu,
+    build_todo_lists_menu,
     build_vacuum_rooms,
     build_vacuum_routines,
     group_sensor_entities,
@@ -90,6 +93,8 @@ _WRITE_PREFIXES: frozenset[str] = frozenset({
     "nact", "nmute", "fa_run", "fa_del", "schtog", "schdel", "snapdel",
     "mvol", "mmut", "msrs", "ssel", "nval", "pin",
     "qsc", "lcs", "gcl", "rad", "rout",
+    "atog", "atrig",  # automations
+    "tdc", "tdd",     # to-do complete/delete
 })
 
 # Prefixes exempt from idempotency guard (debounce-eligible rapid taps)
@@ -182,6 +187,9 @@ class Handlers:
         self._pending_brightness: dict[tuple[int, int, str], int] = {}
         self._pending_volume: dict[tuple[int, int, str], float] = {}
         self._debounce_tasks: dict[tuple[int, int, str], asyncio.Task[None]] = {}
+
+        # To-do: pending add item state: chat_id -> list_entity_id
+        self._todo_add_pending: dict[int, str] = {}
 
     # -----------------------------------------------------------------------
     # Security
@@ -589,7 +597,7 @@ class Handlers:
         await message.answer(result)
 
     async def handle_text_search(self, message: Message) -> None:
-        """Handle plain text messages as search queries when in search mode."""
+        """Handle plain text messages as search queries or to-do add input."""
         uid, uname = self._extract_user(message)
         if uid is None:
             return
@@ -597,6 +605,28 @@ class Handlers:
         if not self._is_authorized_chat(cid):
             return
         if not self._is_authorized_user(uid):
+            return
+
+        # To-do add mode: pending add item
+        if cid in self._todo_add_pending:
+            list_eid = self._todo_add_pending.pop(cid)
+            summary = (message.text or "").strip()
+            if not summary:
+                return
+            try:
+                ok, err = await self._ha.call_service(
+                    "todo", "add_item",
+                    {"entity_id": list_eid, "item": summary},
+                )
+            except Exception as exc:
+                logger.exception("Todo add item failed")
+                ok, err = False, str(exc)[:200]
+            if ok:
+                await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                             action="todo.add", entity_id=list_eid, success=True)
+            else:
+                logger.warning("Failed to add todo item: %s", err)
+            await self._show_todo_items(cid, list_eid, 0)
             return
 
         menu_state = await self._db.get_menu_state(cid)
@@ -752,6 +782,12 @@ class Handlers:
             self._push_nav(cid, "nav:main")
             t, k = build_global_color_menu()
             await self._send_or_edit(cid, t, k, menu="gcolor")
+        elif target == "automations":
+            self._push_nav(cid, "nav:main")
+            await self._show_automations(cid, 0)
+        elif target == "todo":
+            self._push_nav(cid, "nav:main")
+            await self._show_todo_lists(cid)
 
     # -----------------------------------------------------------------------
     # fl: — floor selected
@@ -1089,7 +1125,13 @@ class Handlers:
         if ok:
             await self._show_entity_control(cid, uid, eid)
         else:
-            await cb.answer(f"Ошибка: {(err or '')[:180]}", show_alert=True)
+            # Explicit error — never silently ignore (especially for button.press / doorbell)
+            err_msg = (err or "неизвестная ошибка")[:180]
+            logger.warning(
+                "Service call %s.%s failed for %s: %s",
+                domain, service, eid, err_msg,
+            )
+            await cb.answer(f"Ошибка: {err_msg}", show_alert=True)
 
     # -----------------------------------------------------------------------
     # bright: — brightness
@@ -2126,7 +2168,6 @@ class Handlers:
             na = len(self._reg.areas)
             nd = len(self._reg.devices)
             ne = len(self._reg.entities)
-            vac_count = sum(1 for e in self._reg.entities if e.startswith("vacuum."))
             lines = [
                 "\u2705 <b>Синхронизация завершена!</b>",
                 "",
@@ -2135,12 +2176,6 @@ class Handlers:
                 f"\U0001f4f1 Устройств: <b>{nd}</b>",
                 f"\U0001f50c Сущностей: <b>{ne}</b>",
             ]
-            if vac_count:
-                lines.append(f"\U0001f9f9 Пылесосов: <b>{vac_count}</b>")
-            for vac_eid, btns in self._reg.vacuum_routines.items():
-                if btns:
-                    vname = self._reg.get_entity_display_name(vac_eid)
-                    lines.append(f"  \u2514 {vname}: {len(btns)} сценариев")
 
             # Diff summary
             new_areas = set(self._reg.areas.keys())
@@ -2238,16 +2273,54 @@ class Handlers:
         return result
 
     async def _fetch_status_entities(self) -> list[dict[str, Any]]:
-        if not self._cfg.status_entities:
+        if self._cfg.status_entities:
+            entities: list[dict[str, Any]] = []
+            for eid in self._cfg.status_entities:
+                state = await self._ha.get_state(eid)
+                if state and isinstance(state, dict):
+                    entities.append(state)
+                else:
+                    entities.append({"entity_id": eid, "state": "unavailable", "attributes": {}})
+            return entities
+        # No status_entities configured — show currently active entities
+        try:
+            all_states = await self._ha.list_states()
+        except Exception:
+            logger.exception("Failed to fetch states for Status")
             return []
-        entities: list[dict[str, Any]] = []
-        for eid in self._cfg.status_entities:
-            state = await self._ha.get_state(eid)
-            if state and isinstance(state, dict):
-                entities.append(state)
-            else:
-                entities.append({"entity_id": eid, "state": "unavailable", "attributes": {}})
-        return entities
+        domains = frozenset(self._cfg.menu_domains_allowlist)
+        active: list[dict[str, Any]] = []
+        for s in all_states:
+            eid = s.get("entity_id", "")
+            if not eid:
+                continue
+            domain = eid.split(".", 1)[0]
+            if domain not in domains:
+                continue
+            state_val = s.get("state", "")
+            mapped = map_state(eid, state_val, s.get("attributes", {}),
+                               self._device_overrides)
+            if mapped.is_active:
+                active.append(s)
+        if not active:
+            # Nothing active — show summary of all entities by domain count
+            domain_counts: dict[str, int] = {}
+            for s in all_states:
+                eid = s.get("entity_id", "")
+                if not eid:
+                    continue
+                domain = eid.split(".", 1)[0]
+                if domain in domains:
+                    domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            summary: list[dict[str, Any]] = []
+            for d, cnt in sorted(domain_counts.items()):
+                summary.append({
+                    "entity_id": f"{d}._summary",
+                    "state": str(cnt),
+                    "attributes": {"friendly_name": f"{d} ({cnt})", "unit_of_measurement": "шт."},
+                })
+            return summary
+        return active
 
     # -----------------------------------------------------------------------
     # Route table (prefix -> handler)
@@ -2425,7 +2498,7 @@ class Handlers:
         t, k = build_radio_menu(
             stations=stations,
             players=players,
-            current_station_idx=current_station,
+            current_idx=current_station,
             current_player=current_player,
             is_playing=is_playing,
         )
@@ -2532,6 +2605,299 @@ class Handlers:
         await cb.answer(f"\U0001f50a {fname}")
         await self._show_radio(cid)
 
+    # -----------------------------------------------------------------------
+    # Automations
+    # -----------------------------------------------------------------------
+
+    async def _show_automations(self, cid: int, page: int = 0) -> None:
+        """List all automation entities with state."""
+        try:
+            all_states = await self._ha.list_states()
+        except Exception:
+            logger.exception("Failed to fetch states for Automations")
+            all_states = []
+        automations: list[dict[str, Any]] = []
+        for s in all_states:
+            eid = s.get("entity_id", "")
+            if eid.startswith("automation."):
+                fname = s.get("attributes", {}).get("friendly_name", eid)
+                automations.append({
+                    "entity_id": eid,
+                    "friendly_name": fname,
+                    "state": s.get("state", "off"),
+                })
+        automations.sort(key=lambda x: x["friendly_name"].lower())
+        t, k = build_automations_menu(automations, page, self._cfg.menu_page_size)
+        await self._send_or_edit(cid, t, k, menu="automations")
+
+    async def _automation_toggle(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        """Toggle automation on/off."""
+        parts = data.split(":", 1)
+        eid = parts[1] if len(parts) > 1 else ""
+        if not eid:
+            await cb.answer("Некорректная автоматизация.", show_alert=True)
+            return
+        # Get current state to decide enable/disable
+        state = await self._ha.get_state(eid)
+        current = state.get("state", "off") if state else "off"
+        service = "turn_off" if current == "on" else "turn_on"
+        try:
+            ok, err = await self._ha.call_service("automation", service, {"entity_id": eid})
+        except Exception as exc:
+            logger.exception("Automation toggle failed for %s", eid)
+            ok, err = False, str(exc)[:200]
+        if ok:
+            new_state = "выкл" if service == "turn_off" else "вкл"
+            await cb.answer(f"\U0001f916 {new_state}")
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action=f"automation.{service}", entity_id=eid, success=True)
+        else:
+            await cb.answer(f"Ошибка: {(err or '')[:180]}", show_alert=True)
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action=f"automation.{service}", entity_id=eid, success=False, error=err)
+        await self._show_automations(cid)
+
+    async def _automation_trigger(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        """Trigger an automation."""
+        parts = data.split(":", 1)
+        eid = parts[1] if len(parts) > 1 else ""
+        if not eid:
+            await cb.answer("Некорректная автоматизация.", show_alert=True)
+            return
+        try:
+            ok, err = await self._ha.call_service("automation", "trigger", {"entity_id": eid})
+        except Exception as exc:
+            logger.exception("Automation trigger failed for %s", eid)
+            ok, err = False, str(exc)[:200]
+        if ok:
+            await cb.answer("\u25b6 Запущено")
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action="automation.trigger", entity_id=eid, success=True)
+        else:
+            await cb.answer(f"Ошибка: {(err or '')[:180]}", show_alert=True)
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action="automation.trigger", entity_id=eid, success=False, error=err)
+
+    async def _automation_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        parts = data.split(":")
+        page = int(parts[1]) if len(parts) > 1 else 0
+        await cb.answer()
+        await self._show_automations(cid, page)
+
+    # -----------------------------------------------------------------------
+    # To-Do lists
+    # -----------------------------------------------------------------------
+
+    async def _show_todo_lists(self, cid: int) -> None:
+        """List all to-do list entities from HA."""
+        try:
+            all_states = await self._ha.list_states()
+        except Exception:
+            logger.exception("Failed to fetch states for To-Do")
+            all_states = []
+        todo_lists: list[dict[str, Any]] = []
+        for s in all_states:
+            eid = s.get("entity_id", "")
+            if eid.startswith("todo."):
+                fname = s.get("attributes", {}).get("friendly_name", eid)
+                todo_lists.append({"entity_id": eid, "friendly_name": fname})
+        todo_lists.sort(key=lambda x: x["friendly_name"].lower())
+        t, k = build_todo_lists_menu(todo_lists)
+        await self._send_or_edit(cid, t, k, menu="todo")
+
+    async def _todo_list_items(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        """Show items in a selected to-do list."""
+        parts = data.split(":", 1)
+        list_eid = parts[1] if len(parts) > 1 else ""
+        if not list_eid:
+            await cb.answer("Некорректный список.", show_alert=True)
+            return
+        await cb.answer()
+        await self._show_todo_items(cid, list_eid, 0)
+
+    async def _show_todo_items(self, cid: int, list_eid: str, page: int) -> None:
+        """Fetch and display items from a to-do list."""
+        # Get list name
+        state = await self._ha.get_state(list_eid)
+        list_name = state.get("attributes", {}).get("friendly_name", list_eid) if state else list_eid
+        # Fetch items via todo.get_items service
+        try:
+            ok, result = await self._ha.call_service(
+                "todo", "get_items", {"entity_id": list_eid},
+            )
+        except Exception:
+            logger.exception("Failed to get todo items for %s", list_eid)
+            ok, result = False, "Ошибка загрузки"
+        items: list[dict[str, Any]] = []
+        if ok and isinstance(result, dict):
+            # HA returns items under the entity_id key in response
+            items = result.get(list_eid, {}).get("items", [])
+        elif ok and isinstance(result, list):
+            items = result
+        t, k = build_todo_items_menu(list_name, list_eid, items, page, self._cfg.menu_page_size)
+        await self._send_or_edit(cid, t, k, menu=f"todo:{list_eid}")
+
+    async def _todo_complete_item(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        """Mark a to-do item as completed."""
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer("Некорректные данные.", show_alert=True)
+            return
+        list_eid, item_uid = parts[1], parts[2]
+        try:
+            ok, err = await self._ha.call_service(
+                "todo", "update_item",
+                {"entity_id": list_eid, "item": item_uid, "status": "completed"},
+            )
+        except Exception as exc:
+            logger.exception("Todo complete failed")
+            ok, err = False, str(exc)[:200]
+        if ok:
+            await cb.answer("\u2705 Выполнено")
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action="todo.complete", entity_id=list_eid, success=True)
+        else:
+            await cb.answer(f"Ошибка: {(err or '')[:180]}", show_alert=True)
+        await self._show_todo_items(cid, list_eid, 0)
+
+    async def _todo_delete_item(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        """Delete a to-do item."""
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer("Некорректные данные.", show_alert=True)
+            return
+        list_eid, item_uid = parts[1], parts[2]
+        try:
+            ok, err = await self._ha.call_service(
+                "todo", "remove_item",
+                {"entity_id": list_eid, "item": item_uid},
+            )
+        except Exception as exc:
+            logger.exception("Todo delete failed")
+            ok, err = False, str(exc)[:200]
+        if ok:
+            await cb.answer("\U0001f5d1 Удалено")
+            await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                         action="todo.delete", entity_id=list_eid, success=True)
+        else:
+            await cb.answer(f"Ошибка: {(err or '')[:180]}", show_alert=True)
+        await self._show_todo_items(cid, list_eid, 0)
+
+    async def _todo_add_start(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        """Enter add-item mode: next text message will be the item summary."""
+        parts = data.split(":", 1)
+        list_eid = parts[1] if len(parts) > 1 else ""
+        if not list_eid:
+            await cb.answer("Некорректный список.", show_alert=True)
+            return
+        self._todo_add_pending[cid] = list_eid
+        await cb.answer()
+        t = "\U0001f4cb Введите текст новой задачи в чат:"
+        k = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="\u274c Отмена", callback_data=f"menu:todo")],
+        ])
+        await self._send_or_edit(cid, t, k, menu="todo_add")
+
+    async def _todo_page(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
+        """Paginate to-do items."""
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        list_eid = parts[1]
+        page = int(parts[2]) if parts[2].isdigit() else 0
+        await cb.answer()
+        await self._show_todo_items(cid, list_eid, page)
+
+    # -----------------------------------------------------------------------
+    # /terminal command
+    # -----------------------------------------------------------------------
+
+    async def cmd_terminal(self, message: Message) -> None:
+        """Execute a shell command (local container only, restricted)."""
+        uid, uname = self._extract_user(message)
+        if uid is None:
+            return
+        cid = message.chat.id
+        if not self._is_authorized_chat(cid):
+            await message.answer("\u26d4 Неавторизованный чат.")
+            return
+        if not self._is_authorized_user(uid):
+            await message.answer("\u26d4 Неавторизованный пользователь.")
+            return
+        # Terminal must be explicitly enabled in config
+        if not getattr(self._cfg, "terminal_enabled", False):
+            await message.answer(
+                "\u26d4 Терминал отключён.\n"
+                "Включите <code>terminal_enabled: true</code> в настройках add-on.",
+                parse_mode="HTML",
+            )
+            return
+        # Admin only
+        role = await self._db.get_user_role(uid)
+        if role != "admin":
+            await message.answer("\u26d4 Только для администраторов.")
+            return
+
+        parts = (message.text or "").split(maxsplit=1)
+        command = parts[1].strip() if len(parts) > 1 else ""
+        if not command:
+            await message.answer(
+                "\U0001f4bb <b>Терминал</b>\n\n"
+                "Использование: /terminal <code>команда</code>\n"
+                "Пример: /terminal ls -la /app",
+                parse_mode="HTML",
+            )
+            return
+
+        await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
+                     action="terminal", entity_id=None, success=True)
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd="/",
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await message.answer("\u23f0 Таймаут (30с). Процесс завершён.")
+                return
+
+            output = stdout.decode("utf-8", errors="replace") if stdout else ""
+            # Limit output length
+            if len(output) > 3500:
+                output = output[:3500] + "\n... (обрезано)"
+            exit_code = proc.returncode or 0
+            text = (
+                f"\U0001f4bb <b>Терминал</b>\n"
+                f"<code>$ {self._sanitize(command[:100])}</code>\n"
+                f"Exit: {exit_code}\n\n"
+                f"<pre>{self._sanitize(output)}</pre>"
+            )
+        except Exception as exc:
+            text = f"\u274c Ошибка: {self._sanitize(str(exc)[:200])}"
+
+        tid = self._get_thread_id(message)
+        try:
+            await self._bot.send_message(
+                chat_id=cid, text=text, parse_mode="HTML",
+                message_thread_id=tid,
+            )
+        except Exception:
+            # Fallback without HTML if parsing fails
+            await self._bot.send_message(
+                chat_id=cid, text=text[:4000],
+                message_thread_id=tid,
+            )
+
+    @staticmethod
+    def _sanitize(text: str) -> str:
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     _ROUTES: dict[str, Any] = {
         "nav": _nav,
         "menu": _menu,
@@ -2582,4 +2948,14 @@ class Handlers:
         "rad": _radio_control,
         "rout": _radio_output,
         "scp": _scenario_page,
+        # Automations
+        "atog": _automation_toggle,
+        "atrig": _automation_trigger,
+        "autp": _automation_page,
+        # To-Do
+        "tdl": _todo_list_items,
+        "tdc": _todo_complete_item,
+        "tdd": _todo_delete_item,
+        "tda": _todo_add_start,
+        "tdp": _todo_page,
     }

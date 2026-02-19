@@ -143,7 +143,14 @@ def build_main_menu() -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="\u2b50 Избранное", callback_data="menu:favorites"),
         ],
         [
+            InlineKeyboardButton(text="\U0001f514 Уведомления", callback_data="menu:notif"),
+            InlineKeyboardButton(text="\U0001f916 Автоматизации", callback_data="menu:automations"),
+        ],
+        [
+            InlineKeyboardButton(text="\U0001f4cb Списки дел", callback_data="menu:todo"),
             InlineKeyboardButton(text="\u2139\ufe0f Статус", callback_data="menu:status"),
+        ],
+        [
             InlineKeyboardButton(text="\U0001f504 SYNC", callback_data="menu:refresh"),
         ],
     ])
@@ -1324,6 +1331,7 @@ def build_help_menu() -> tuple[str, InlineKeyboardMarkup]:
         "/snapshot \u2014 Снимок состояний\n"
         "/snapshots \u2014 Список снимков\n"
         "/schedule \u2014 Расписание\n"
+        "/terminal <i>команда</i> \u2014 Терминал (admin)\n"
         "/health \u2014 Проверка здоровья\n"
         "/diag \u2014 Диагностика\n"
         "/role \u2014 Управление ролями (admin)\n"
@@ -1334,7 +1342,10 @@ def build_help_menu() -> tuple[str, InlineKeyboardMarkup]:
         "\u2022 <b>Активные</b> \u2014 Все включённые устройства\n"
         "\u2022 <b>Радио</b> \u2014 Радиостанции\n"
         "\u2022 <b>Цвет света</b> \u2014 Глобальные цветовые сцены\n"
-        "\u2022 <b>Избранное</b> \u2014 Быстрый доступ\n\n"
+        "\u2022 <b>Избранное</b> \u2014 Быстрый доступ\n"
+        "\u2022 <b>Уведомления</b> \u2014 Настройка уведомлений\n"
+        "\u2022 <b>Автоматизации</b> \u2014 Управление автоматизациями\n"
+        "\u2022 <b>Списки дел</b> \u2014 To-Do списки HA\n\n"
         "Все меню обновляются в одном сообщении."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1411,3 +1422,154 @@ def group_sensor_entities(
         remaining.append(s)
 
     return non_sensors + remaining
+
+
+# ---------------------------------------------------------------------------
+# Automations menu
+# ---------------------------------------------------------------------------
+
+
+def build_automations_menu(
+    automations: list[dict[str, Any]],
+    page: int = 0,
+    page_size: int = 8,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Show list of automations with toggle and trigger buttons."""
+    if not automations:
+        text = "\U0001f916 <b>Автоматизации</b>\n\nАвтоматизации не найдены."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[_home_btn()]])
+        return text, kb
+
+    total = len(automations)
+    pages = max(1, math.ceil(total / page_size))
+    page = max(0, min(page, pages - 1))
+    start = page * page_size
+    end = start + page_size
+    page_items = automations[start:end]
+
+    text = f"\U0001f916 <b>Автоматизации</b> ({total})\n\n"
+    rows: list[list[InlineKeyboardButton]] = []
+    for a in page_items:
+        eid = a["entity_id"]
+        name = a.get("friendly_name", eid)
+        state = a.get("state", "off")
+        icon = "\u2705" if state == "on" else "\u274c"
+        text += f"{icon} {_sanitize(_trunc(name, 40))}\n"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{icon} {_trunc(name, 18)}",
+                callback_data=f"atog:{eid}",
+            ),
+            InlineKeyboardButton(
+                text="\u25b6 Run",
+                callback_data=f"atrig:{eid}",
+            ),
+        ])
+
+    # Pagination
+    if pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="\u2b05", callback_data=f"autp:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="\u27a1", callback_data=f"autp:{page + 1}"))
+        rows.append(nav)
+
+    rows.append([_home_btn()])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------------------------------------------------------------------------
+# To-Do lists menu
+# ---------------------------------------------------------------------------
+
+
+def build_todo_lists_menu(
+    lists: list[dict[str, Any]],
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Show available HA to-do lists."""
+    if not lists:
+        text = "\U0001f4cb <b>Списки дел</b>\n\nСписки дел не найдены."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[_home_btn()]])
+        return text, kb
+
+    text = f"\U0001f4cb <b>Списки дел</b> ({len(lists)})\n\nВыберите список:"
+    rows: list[list[InlineKeyboardButton]] = []
+    for td in lists[:10]:
+        eid = td["entity_id"]
+        name = td.get("friendly_name", eid)
+        cb = f"tdl:{eid}"
+        if len(cb) <= 64:
+            rows.append([InlineKeyboardButton(
+                text=f"\U0001f4cb {_trunc(name, 28)}",
+                callback_data=cb,
+            )])
+
+    rows.append([_home_btn()])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_todo_items_menu(
+    list_name: str,
+    list_eid: str,
+    items: list[dict[str, Any]],
+    page: int = 0,
+    page_size: int = 8,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Show items in a to-do list."""
+    total = len(items)
+    pages = max(1, math.ceil(total / page_size))
+    page = max(0, min(page, pages - 1))
+    start = page * page_size
+    end = start + page_size
+    page_items = items[start:end]
+
+    text = f"\U0001f4cb <b>{_sanitize(list_name)}</b>"
+    if not items:
+        text += "\n\nСписок пуст."
+    else:
+        text += f" ({total})\n\n"
+        for item in page_items:
+            summary = item.get("summary", "???")
+            status = item.get("status", "needs_action")
+            icon = "\u2705" if status == "completed" else "\u2b1c"
+            text += f"{icon} {_sanitize(_trunc(summary, 40))}\n"
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # Item action buttons (complete/delete)
+    for item in page_items:
+        uid = item.get("uid", "")
+        summary = item.get("summary", "???")
+        status = item.get("status", "needs_action")
+        btns: list[InlineKeyboardButton] = []
+        if status != "completed":
+            cb = f"tdc:{list_eid}:{uid}"
+            if len(cb) <= 64:
+                btns.append(InlineKeyboardButton(text="\u2705", callback_data=cb))
+        cb_del = f"tdd:{list_eid}:{uid}"
+        if len(cb_del) <= 64:
+            btns.append(InlineKeyboardButton(
+                text=f"\U0001f5d1 {_trunc(summary, 16)}",
+                callback_data=cb_del,
+            ))
+        if btns:
+            rows.append(btns)
+
+    # Pagination
+    if pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="\u2b05", callback_data=f"tdp:{list_eid}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(text="\u27a1", callback_data=f"tdp:{list_eid}:{page + 1}"))
+        rows.append(nav)
+
+    # Add item button
+    rows.append([InlineKeyboardButton(text="\u2795 Добавить", callback_data=f"tda:{list_eid}")])
+    rows.append([
+        InlineKeyboardButton(text="\u2b05 Назад", callback_data="menu:todo"),
+        _home_btn(),
+    ])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)

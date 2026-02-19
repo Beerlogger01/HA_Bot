@@ -295,6 +295,8 @@ class HARegistry:
                 self.floors[area.floor_id].area_ids.append(area.area_id)
 
         # Entities -> areas (entity.area_id takes priority, else device.area_id)
+        assigned_count = 0
+        unassigned_count = 0
         for ent in self.entities.values():
             if ent.disabled_by:
                 continue
@@ -305,6 +307,13 @@ class HARegistry:
                     area_id = dev.area_id
             if area_id and area_id in self.areas:
                 self.areas[area_id].entity_ids.append(ent.entity_id)
+                assigned_count += 1
+            else:
+                unassigned_count += 1
+        logger.info(
+            "Cross-refs built: %d entities assigned to areas, %d unassigned",
+            assigned_count, unassigned_count,
+        )
 
     # -------------------------------------------------------------------
     # Vacuum: detect routines (button entities on same device)
@@ -562,6 +571,11 @@ class HARegistry:
         "_ip_address", "_mac_address", "_firmware",
     )
 
+    # Entities that should not be picked as primary control for a device
+    _DND_SUFFIXES: tuple[str, ...] = (
+        "_do_not_disturb", "_dnd", "_mute_mode", "_night_mode",
+    )
+
     def _pick_primary_domain(self, entity_ids: list[str]) -> str:
         """Pick the most relevant domain from a list of entity IDs for icon display."""
         domains = {eid.split(".", 1)[0] for eid in entity_ids}
@@ -573,7 +587,8 @@ class HARegistry:
     def _pick_primary_entity(self, eids: list[str]) -> str:
         """Pick the most representative entity for a device.
 
-        Uses domain priority, penalises junk suffixes and diagnostic entities.
+        Uses domain priority, penalises junk suffixes, DND entities,
+        and diagnostic entities.
         """
         if len(eids) <= 1:
             return eids[0] if eids else ""
@@ -588,12 +603,17 @@ class HARegistry:
             penalty = 0
             if any(suffix.endswith(j) for j in self._JUNK_SUFFIXES):
                 penalty = 1
+            # Penalise DND/mute entities — they should never be primary control
+            if any(suffix.endswith(d) for d in self._DND_SUFFIXES):
+                penalty = 3
             ent = self.entities.get(eid)
             if ent and ent.entity_category in ("diagnostic", "config"):
-                penalty = 2
+                penalty = max(penalty, 2)
             return (domain_rank, penalty, eid)
 
-        return min(eids, key=_key)
+        primary = min(eids, key=_key)
+        logger.debug("Primary entity selected: %s from %s", primary, eids)
+        return primary
 
     def get_devices_for_area(
         self, area_id: str, domains: frozenset[str] | None = None,

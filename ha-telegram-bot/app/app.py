@@ -112,6 +112,7 @@ class Config:
     goodnight_scene_id: str
     radio_stations: tuple[dict[str, str], ...]
     device_overrides: dict[str, dict[str, Any]]
+    terminal_enabled: bool
 
 
 def _coerce_user_ids(raw: Any) -> list[int]:
@@ -315,6 +316,13 @@ def _load_and_validate_config() -> tuple[Config, str]:
     if device_overrides:
         logger.info("Device overrides loaded for %d entities", len(device_overrides))
 
+    # -- terminal (disabled by default) --
+    terminal_enabled = raw.get("terminal_enabled", False)
+    if not isinstance(terminal_enabled, bool):
+        terminal_enabled = False
+    if terminal_enabled:
+        logger.info("Terminal feature is ENABLED — restricted to admin users")
+
     # --- SUPERVISOR_TOKEN ---
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not supervisor_token:
@@ -341,6 +349,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
         goodnight_scene_id=scene,
         radio_stations=tuple(radio_stations),
         device_overrides=device_overrides,
+        terminal_enabled=terminal_enabled,
     )
     return config, supervisor_token
 
@@ -587,6 +596,7 @@ class TelegramBot:
         self._dp.message.register(self._handlers.cmd_export_settings, Command("export_settings"))
         self._dp.message.register(self._handlers.cmd_import_settings, Command("import_settings"))
         self._dp.message.register(self._handlers.cmd_notify_test, Command("notify_test"))
+        self._dp.message.register(self._handlers.cmd_terminal, Command("terminal"))
         self._dp.callback_query.register(self._handlers.handle_callback)
         # Text search handler (must be last — catches all text messages)
         self._dp.message.register(self._handlers.handle_text_search)

@@ -1,5 +1,5 @@
 name: "Home Assistant Telegram Bot"
-version: "2.3.5"
+version: "2.3.6"
 slug: ha_telegram_bot
 description: "Interactive Telegram bot with dynamic HA mirroring (floors/areas/devices), vacuum room targeting, Roborock routines, media player controls, full domain support, favorites with pinned items, notifications with completion events, search, snapshots, scheduler, diagnostics, role-based access control, and dynamic device discovery for Home Assistant"
 image: "ghcr.io/beerlogger01/ha-bot-ha-telegram-bot-{arch}"
@@ -62,6 +62,7 @@ options:
     - name: "Europa Plus"
       url: "https://ep256.hostingradio.ru:8052/europaplus256.mp3"
   device_overrides: []
+  terminal_enabled: false
 
 schema:
   bot_token: password
@@ -98,3 +99,4 @@ schema:
       idle_states:
         - str?
       running_threshold_watts: float?
+  terminal_enabled: bool?
