@@ -19,6 +19,8 @@ from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from state_mapping import map_state
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -81,6 +83,24 @@ def _sanitize(text: str) -> str:
 
 
 def _state_icon(domain: str, state: str) -> str:
+    # Read-only sensors: blue for "on" (informational), not green
+    if domain in ("binary_sensor", "event", "sensor"):
+        if state in ("unavailable", "unknown"):
+            return "\U0001f534"
+        if state == "on":
+            return "\U0001f535"
+        return "\u26aa"
+    # Climate: active modes are green, idle/off is white
+    if domain == "climate":
+        if state in ("heating", "cooling", "drying", "heat", "cool",
+                      "heat_cool", "auto"):
+            return "\U0001f7e2"
+        if state in ("off", "idle"):
+            return "\u26aa"
+        if state in ("unavailable", "unknown"):
+            return "\U0001f534"
+        return "\U0001f535"
+    # Default (light, switch, vacuum, media_player, etc.)
     if state in ("on", "open", "cleaning", "playing", "home"):
         return "\U0001f7e2"
     if state in ("off", "closed", "docked", "idle", "paused", "standby"):
@@ -407,10 +427,13 @@ def build_entity_control(
     domain = entity_id.split(".", 1)[0]
     attrs = state_data.get("attributes", {})
     name = attrs.get("friendly_name", entity_id)
-    state = state_data.get("state", "unknown")
+    raw_state = state_data.get("state", "unknown")
     icon = DOMAIN_ICONS.get(domain, "\U0001f4e6")
 
-    text = f"{icon} <b>{_sanitize(name)}</b>\n\nСостояние: <code>{_sanitize(state)}</code>"
+    mapped = map_state(entity_id, raw_state, attrs)
+    state_label = mapped.ui_label if mapped.ui_label != raw_state else raw_state
+    text = f"{icon} <b>{_sanitize(name)}</b>\n\nСостояние: <code>{_sanitize(state_label)}</code>"
+    state = raw_state  # keep raw for _control_buttons
 
     extra: list[str] = []
     if domain == "climate":
@@ -477,6 +500,19 @@ def build_entity_control(
             extra.append(f"\U0001f321 Текущая: {ct}\u00b0")
         if tt is not None:
             extra.append(f"\U0001f3af Целевая: {tt}\u00b0")
+    elif domain == "binary_sensor":
+        device_class = attrs.get("device_class", "")
+        if device_class:
+            extra.append(f"Тип: {_sanitize(str(device_class))}")
+        extra.append("(только чтение)")
+    elif domain == "event":
+        event_types = attrs.get("event_types", [])
+        if event_types:
+            extra.append(f"События: {', '.join(str(e) for e in event_types[:5])}")
+        last = attrs.get("event_type")
+        if last:
+            extra.append(f"Последнее: {_sanitize(str(last))}")
+        extra.append("(только чтение)")
 
     if extra:
         text += "\n" + "\n".join(extra)
@@ -619,6 +655,12 @@ def _control_buttons(
 
     elif domain == "sensor":
         pass  # read-only, no controls
+
+    elif domain == "binary_sensor":
+        pass  # read-only, no controls
+
+    elif domain == "event":
+        pass  # event entities are read-only triggers
 
     else:
         rows.append([

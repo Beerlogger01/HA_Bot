@@ -1483,3 +1483,246 @@ class TestVerifyTelegramToken:
             await bot._verify_telegram_token()
         assert exc_info.value.code == 1
         assert bot._bot.get_me.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Primary entity selection tests
+# ---------------------------------------------------------------------------
+
+
+class TestPickPrimaryEntity:
+    """Tests for _pick_primary_entity in HARegistry."""
+
+    def _build_registry(self) -> "HARegistry":
+        from registry import HARegistry
+        reg = HARegistry.__new__(HARegistry)
+        reg.entities = {}
+        reg.devices = {}
+        reg.areas = {}
+        return reg
+
+    def test_media_player_over_sensor(self) -> None:
+        reg = self._build_registry()
+        result = reg._pick_primary_entity([
+            "sensor.audio_signal", "media_player.audio", "binary_sensor.audio_connected",
+        ])
+        assert result == "media_player.audio"
+
+    def test_switch_over_sensor(self) -> None:
+        reg = self._build_registry()
+        result = reg._pick_primary_entity([
+            "sensor.kettle_connectivity", "switch.kettle",
+        ])
+        assert result == "switch.kettle"
+
+    def test_light_over_switch(self) -> None:
+        reg = self._build_registry()
+        result = reg._pick_primary_entity([
+            "switch.lamp", "light.lamp",
+        ])
+        assert result == "light.lamp"
+
+    def test_junk_suffix_deprioritized(self) -> None:
+        reg = self._build_registry()
+        result = reg._pick_primary_entity([
+            "sensor.device_signal_strength", "sensor.device_temperature",
+        ])
+        assert result == "sensor.device_temperature"
+
+    def test_diagnostic_category_deprioritized(self) -> None:
+        from registry import EntityInfo
+        reg = self._build_registry()
+        reg.entities["sensor.diag"] = EntityInfo(
+            entity_id="sensor.diag", entity_category="diagnostic",
+        )
+        reg.entities["light.main"] = EntityInfo(entity_id="light.main")
+        result = reg._pick_primary_entity(["sensor.diag", "light.main"])
+        assert result == "light.main"
+
+    def test_single_entity(self) -> None:
+        reg = self._build_registry()
+        assert reg._pick_primary_entity(["sensor.only"]) == "sensor.only"
+
+    def test_vacuum_wins(self) -> None:
+        reg = self._build_registry()
+        result = reg._pick_primary_entity([
+            "sensor.vac_battery", "vacuum.robo", "button.vac_reset",
+        ])
+        assert result == "vacuum.robo"
+
+
+# ---------------------------------------------------------------------------
+# State mapping tests
+# ---------------------------------------------------------------------------
+
+
+class TestStateMapping:
+    """Tests for state_mapping.map_state and is_junk_primary."""
+
+    def test_light_on_is_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("light.kitchen", "on")
+        assert m.is_active is True
+        assert m.ui_state == "ON"
+
+    def test_light_off_not_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("light.kitchen", "off")
+        assert m.is_active is False
+        assert m.ui_state == "OFF"
+
+    def test_binary_sensor_is_read_only(self) -> None:
+        from state_mapping import map_state
+        m = map_state("binary_sensor.doorbell", "on")
+        assert m.is_read_only is True
+
+    def test_event_is_read_only(self) -> None:
+        from state_mapping import map_state
+        m = map_state("event.doorbell_press", "2024-01-01T00:00:00")
+        assert m.is_read_only is True
+
+    def test_vacuum_cleaning_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("vacuum.robo", "cleaning")
+        assert m.is_active is True
+
+    def test_vacuum_docked_not_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("vacuum.robo", "docked")
+        assert m.is_active is False
+
+    def test_media_player_playing_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("media_player.tv", "playing")
+        assert m.is_active is True
+
+    def test_media_player_standby_not_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("media_player.tv", "standby")
+        assert m.is_active is False
+
+    def test_media_player_on_not_active(self) -> None:
+        """media_player 'on' but not playing — should NOT be active."""
+        from state_mapping import map_state
+        m = map_state("media_player.tv", "on")
+        assert m.is_active is False
+
+    def test_climate_heating_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("climate.living", "heating")
+        assert m.is_active is True
+
+    def test_climate_idle_not_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("climate.living", "idle")
+        assert m.is_active is False
+
+    def test_unavailable_not_active(self) -> None:
+        from state_mapping import map_state
+        m = map_state("light.test", "unavailable")
+        assert m.is_active is False
+        assert m.ui_state == "UNAVAILABLE"
+
+    def test_override_active_states(self) -> None:
+        from state_mapping import map_state
+        overrides = {
+            "switch.kettle": {
+                "active_states": ["heating"],
+                "idle_states": ["on", "standby"],
+            },
+        }
+        m = map_state("switch.kettle", "on", overrides=overrides)
+        assert m.is_active is False
+        m2 = map_state("switch.kettle", "heating", overrides=overrides)
+        assert m2.is_active is True
+
+    def test_power_threshold_override(self) -> None:
+        from state_mapping import map_state
+        overrides = {
+            "sensor.dishwasher_power": {"running_threshold_watts": 10},
+        }
+        m = map_state("sensor.dishwasher_power", "5.0", overrides=overrides)
+        assert m.is_active is False
+        assert m.ui_state == "IDLE"
+        m2 = map_state("sensor.dishwasher_power", "150.0", overrides=overrides)
+        assert m2.is_active is True
+        assert m2.ui_state == "RUNNING"
+
+    def test_russian_label(self) -> None:
+        from state_mapping import map_state
+        m = map_state("light.test", "on")
+        assert m.ui_label == "Вкл"
+        m2 = map_state("vacuum.test", "cleaning")
+        assert m2.ui_label == "Уборка"
+
+    def test_junk_primary_detection(self) -> None:
+        from state_mapping import is_junk_primary
+        assert is_junk_primary("sensor.device_signal_strength") is True
+        assert is_junk_primary("binary_sensor.device_connectivity") is True
+        assert is_junk_primary("switch.kettle") is False
+        assert is_junk_primary("light.living_room") is False
+
+
+# ---------------------------------------------------------------------------
+# State icon domain-awareness tests
+# ---------------------------------------------------------------------------
+
+
+class TestStateIconDomainAware:
+    """Tests for domain-aware _state_icon in ui.py."""
+
+    def test_binary_sensor_on_blue(self) -> None:
+        from ui import _state_icon
+        assert _state_icon("binary_sensor", "on") == "\U0001f535"
+
+    def test_light_on_green(self) -> None:
+        from ui import _state_icon
+        assert _state_icon("light", "on") == "\U0001f7e2"
+
+    def test_sensor_off_white(self) -> None:
+        from ui import _state_icon
+        assert _state_icon("sensor", "off") == "\u26aa"
+
+    def test_climate_heating_green(self) -> None:
+        from ui import _state_icon
+        assert _state_icon("climate", "heating") == "\U0001f7e2"
+
+    def test_climate_idle_white(self) -> None:
+        from ui import _state_icon
+        assert _state_icon("climate", "idle") == "\u26aa"
+
+    def test_switch_on_green(self) -> None:
+        from ui import _state_icon
+        assert _state_icon("switch", "on") == "\U0001f7e2"
+
+
+# ---------------------------------------------------------------------------
+# Control buttons domain handling tests
+# ---------------------------------------------------------------------------
+
+
+class TestControlButtonsDomainHandling:
+    """Tests for _control_buttons handling of read-only domains."""
+
+    def test_binary_sensor_no_action_buttons(self) -> None:
+        from ui import _control_buttons
+        rows = _control_buttons("binary_sensor", "binary_sensor.door", "on", {})
+        all_cbs = [btn.callback_data for row in rows for btn in row]
+        assert not any(cb.startswith("act:") for cb in all_cbs)
+
+    def test_event_no_buttons(self) -> None:
+        from ui import _control_buttons
+        rows = _control_buttons("event", "event.doorbell", "", {})
+        assert len(rows) == 0
+
+    def test_sensor_no_buttons(self) -> None:
+        from ui import _control_buttons
+        rows = _control_buttons("sensor", "sensor.temp", "23.5", {})
+        assert len(rows) == 0
+
+    def test_switch_has_action_buttons(self) -> None:
+        from ui import _control_buttons
+        rows = _control_buttons("switch", "switch.light", "on", {})
+        all_cbs = [btn.callback_data for row in rows for btn in row]
+        assert any("turn_on" in cb for cb in all_cbs)
+        assert any("turn_off" in cb for cb in all_cbs)

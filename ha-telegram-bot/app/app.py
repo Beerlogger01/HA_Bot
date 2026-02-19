@@ -111,6 +111,7 @@ class Config:
     vacuum_entity_id: str
     goodnight_scene_id: str
     radio_stations: tuple[dict[str, str], ...]
+    device_overrides: dict[str, dict[str, Any]]
 
 
 def _coerce_user_ids(raw: Any) -> list[int]:
@@ -301,6 +302,19 @@ def _load_and_validate_config() -> tuple[Config, str]:
     if not radio_stations:
         radio_stations = default_radio
 
+    # -- device overrides (optional, backward-compatible) --
+    raw_overrides = raw.get("device_overrides", [])
+    device_overrides: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_overrides, list):
+        for entry in raw_overrides:
+            if isinstance(entry, dict) and "entity_id" in entry:
+                eid = str(entry["entity_id"])
+                device_overrides[eid] = {
+                    k: v for k, v in entry.items() if k != "entity_id"
+                }
+    if device_overrides:
+        logger.info("Device overrides loaded for %d entities", len(device_overrides))
+
     # --- SUPERVISOR_TOKEN ---
     supervisor_token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not supervisor_token:
@@ -326,6 +340,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
         vacuum_entity_id=vacuum,
         goodnight_scene_id=scene,
         radio_stations=tuple(radio_stations),
+        device_overrides=device_overrides,
     )
     return config, supervisor_token
 

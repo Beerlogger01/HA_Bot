@@ -549,18 +549,51 @@ class HARegistry:
     # Device grouping for area menus
     # -------------------------------------------------------------------
 
+    _DOMAIN_PRIORITY: list[str] = [
+        "vacuum", "media_player", "climate", "light", "cover", "fan",
+        "switch", "lock", "water_heater", "scene", "script", "select",
+        "number", "button", "sensor", "binary_sensor",
+    ]
+    _DOMAIN_RANK: dict[str, int] = {d: i for i, d in enumerate(_DOMAIN_PRIORITY)}
+
+    _JUNK_SUFFIXES: tuple[str, ...] = (
+        "_signal_strength", "_linkquality", "_link_quality",
+        "_connectivity", "_rssi", "_battery_level",
+        "_ip_address", "_mac_address", "_firmware",
+    )
+
     def _pick_primary_domain(self, entity_ids: list[str]) -> str:
         """Pick the most relevant domain from a list of entity IDs for icon display."""
-        priority = [
-            "vacuum", "media_player", "climate", "light", "cover", "fan",
-            "switch", "lock", "water_heater", "scene", "script", "select",
-            "number", "button", "sensor", "binary_sensor",
-        ]
         domains = {eid.split(".", 1)[0] for eid in entity_ids}
-        for d in priority:
+        for d in self._DOMAIN_PRIORITY:
             if d in domains:
                 return d
         return next(iter(domains), "unknown")
+
+    def _pick_primary_entity(self, eids: list[str]) -> str:
+        """Pick the most representative entity for a device.
+
+        Uses domain priority, penalises junk suffixes and diagnostic entities.
+        """
+        if len(eids) <= 1:
+            return eids[0] if eids else ""
+
+        rank_limit = len(self._DOMAIN_PRIORITY)
+
+        def _key(eid: str) -> tuple[int, int, str]:
+            domain = eid.split(".", 1)[0]
+            domain_rank = self._DOMAIN_RANK.get(domain, rank_limit)
+            # Penalise junk entities (connectivity, signal, etc.)
+            suffix = eid.split(".", 1)[1] if "." in eid else ""
+            penalty = 0
+            if any(suffix.endswith(j) for j in self._JUNK_SUFFIXES):
+                penalty = 1
+            ent = self.entities.get(eid)
+            if ent and ent.entity_category in ("diagnostic", "config"):
+                penalty = 2
+            return (domain_rank, penalty, eid)
+
+        return min(eids, key=_key)
 
     def get_devices_for_area(
         self, area_id: str, domains: frozenset[str] | None = None,
@@ -600,10 +633,7 @@ class HARegistry:
 
             # For vacuum devices, filter out companion entities from the visible list
             # but keep them internally for the device view
-            if is_vacuum:
-                primary = next((e for e in eids if e.startswith("vacuum.")), eids[0])
-            else:
-                primary = eids[0]
+            primary = self._pick_primary_entity(eids)
 
             name = dev.name if dev else self.get_entity_display_name(primary)
             primary_domain = self._pick_primary_domain(eids)
@@ -640,7 +670,7 @@ class HARegistry:
         for dev_id, eids in device_entities.items():
             dev = self.devices.get(dev_id)
             is_vacuum = any(e.startswith("vacuum.") for e in eids)
-            primary = next((e for e in eids if e.startswith("vacuum.")), eids[0]) if is_vacuum else eids[0]
+            primary = self._pick_primary_entity(eids)
             name = dev.name if dev else self.get_entity_display_name(primary)
             primary_domain = self._pick_primary_domain(eids)
             result.append({

@@ -26,9 +26,9 @@ from api import HAClient
 from diagnostics import Diagnostics
 from registry import HARegistry
 from scheduler import Scheduler, next_cron_time, validate_cron
+from state_mapping import map_state
 from storage import Database
 from ui import (
-    _ACTIVE_STATES,
     COLOR_PRESETS,
     build_active_now_menu,
     build_areas_menu,
@@ -163,6 +163,7 @@ class Handlers:
         self._vac = vacuum
         self._diag = diagnostics
         self._sched = scheduler
+        self._device_overrides = getattr(config, "device_overrides", {})
         self.ha_version: str = "unknown"
 
         # In-memory search result cache: chat_id -> entity list
@@ -2041,14 +2042,19 @@ class Handlers:
 
     async def _show_active_now(self, cid: int, uid: int, page: int) -> None:
         """Show all entities that are currently in an active state, deduplicated by device."""
+        _DOMAIN_RANK = {
+            "vacuum": 0, "media_player": 1, "climate": 2, "light": 3,
+            "cover": 4, "fan": 5, "switch": 6, "lock": 7, "water_heater": 8,
+        }
         domains = frozenset(self._cfg.menu_domains_allowlist)
         try:
             all_states = await self._ha.list_states()
         except Exception:
             logger.exception("Failed to fetch states for Active Now")
             all_states = []
-        active: list[dict[str, Any]] = []
-        seen_devices: set[str] = set()
+        # Collect best active entity per device, prioritising by domain rank
+        device_best: dict[str, tuple[int, dict[str, Any]]] = {}
+        no_device: list[dict[str, Any]] = []
         for s in all_states:
             eid = s.get("entity_id", "")
             if not eid:
@@ -2057,21 +2063,27 @@ class Handlers:
             if domain not in domains:
                 continue
             state_val = s.get("state", "")
-            if state_val in _ACTIVE_STATES:
-                # Device deduplication: group by device_id, show primary entity
-                ent_info = self._reg.entities.get(eid)
-                dev_id = ent_info.device_id if ent_info and ent_info.device_id else None
-                if dev_id:
-                    if dev_id in seen_devices:
-                        continue
-                    seen_devices.add(dev_id)
-                fname = s.get("attributes", {}).get("friendly_name", eid)
-                active.append({
-                    "entity_id": eid,
-                    "friendly_name": fname,
-                    "state": state_val,
-                    "domain": domain,
-                })
+            mapped = map_state(eid, state_val, s.get("attributes", {}),
+                               self._device_overrides)
+            if not mapped.is_active:
+                continue
+            fname = s.get("attributes", {}).get("friendly_name", eid)
+            entry = {
+                "entity_id": eid,
+                "friendly_name": fname,
+                "state": state_val,
+                "domain": domain,
+            }
+            ent_info = self._reg.entities.get(eid)
+            dev_id = ent_info.device_id if ent_info and ent_info.device_id else None
+            if dev_id:
+                rank = _DOMAIN_RANK.get(domain, 99)
+                existing = device_best.get(dev_id)
+                if existing is None or rank < existing[0]:
+                    device_best[dev_id] = (rank, entry)
+            else:
+                no_device.append(entry)
+        active = [ent for _, ent in device_best.values()] + no_device
         # Cache for pagination
         self._search_cache[cid] = active
         t, k = build_active_now_menu(active, page, self._cfg.menu_page_size)
