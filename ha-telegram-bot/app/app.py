@@ -21,15 +21,18 @@ Features:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.filters import Command
 
 from api import HAClient
@@ -149,11 +152,44 @@ def _load_and_validate_config() -> tuple[Config, str]:
         logger.critical("Cannot read %s: %s", OPTIONS_PATH, exc)
         sys.exit(1)
 
-    # -- required --
+    # -- required: bot_token (strict validation) --
     bot_token = raw.get("bot_token", "")
-    if not isinstance(bot_token, str) or not bot_token.strip():
-        logger.critical("bot_token is missing or empty")
+    if not isinstance(bot_token, str):
+        logger.critical(
+            "bot_token must be a string (got %s). "
+            "Check %s or the add-on configuration UI.",
+            type(bot_token).__name__, OPTIONS_PATH,
+        )
         sys.exit(1)
+
+    # Strip whitespace / newlines (common copy-paste mistake)
+    bot_token = bot_token.strip()
+
+    # Strip surrounding quotes if someone pasted "token" into options.json value
+    if len(bot_token) >= 2 and bot_token[0] == bot_token[-1] and bot_token[0] in ('"', "'"):
+        bot_token = bot_token[1:-1].strip()
+
+    if not bot_token:
+        logger.critical(
+            "bot_token is empty. Set it in %s or in the add-on configuration UI.",
+            OPTIONS_PATH,
+        )
+        sys.exit(1)
+
+    # Basic format check: Telegram tokens look like "123456:ABC-DEF..."
+    if not re.match(r"^\d+:[A-Za-z0-9_-]+$", bot_token):
+        _fp = hashlib.sha256(bot_token.encode()).hexdigest()[:8]
+        logger.critical(
+            "bot_token looks malformed (len=%d, fingerprint=%s). "
+            "Expected format: 123456789:AABBcc... "
+            "Check %s — the token may contain extra characters.",
+            len(bot_token), _fp, OPTIONS_PATH,
+        )
+        sys.exit(1)
+
+    # Safe fingerprint for diagnostics (never log the full token)
+    _token_fp = hashlib.sha256(bot_token.encode()).hexdigest()[:8]
+    logger.info("Telegram token loaded (len=%d, fp=%s)", len(bot_token), _token_fp)
 
     # -- chat id --
     allowed_chat_id = raw.get("allowed_chat_id", 0)
@@ -272,7 +308,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
         sys.exit(1)
 
     config = Config(
-        bot_token=bot_token.strip(),
+        bot_token=bot_token,
         allowed_chat_id=allowed_chat_id,
         allowed_user_ids=frozenset(user_ids),
         cooldown_seconds_default=cooldown_default,
@@ -337,6 +373,50 @@ class TelegramBot:
     # Startup helpers
     # -------------------------------------------------------------------
 
+    _TELEGRAM_VERIFY_RETRIES = 3
+    _TELEGRAM_VERIFY_BACKOFF = 2.0
+
+    async def _verify_telegram_token(self) -> Any:
+        """Call getMe to verify the bot token before starting polling.
+
+        - On TelegramUnauthorizedError: log a clear message and exit.
+        - On transient network errors: retry up to 3 times with backoff.
+        - Returns the User object on success.
+        """
+        delay = self._TELEGRAM_VERIFY_BACKOFF
+        for attempt in range(1, self._TELEGRAM_VERIFY_RETRIES + 1):
+            try:
+                return await self._bot.get_me()
+            except TelegramUnauthorizedError:
+                _fp = hashlib.sha256(
+                    self._config.bot_token.encode(),
+                ).hexdigest()[:8]
+                logger.critical(
+                    "Telegram Unauthorized — bot token is invalid or revoked "
+                    "(len=%d, fp=%s). Create a new token via @BotFather "
+                    "and update %s or the add-on configuration.",
+                    len(self._config.bot_token), _fp, OPTIONS_PATH,
+                )
+                sys.exit(1)
+            except Exception as exc:
+                if attempt < self._TELEGRAM_VERIFY_RETRIES:
+                    logger.warning(
+                        "Telegram getMe failed (attempt %d/%d: %s), "
+                        "retrying in %.0fs...",
+                        attempt, self._TELEGRAM_VERIFY_RETRIES, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 15)
+                else:
+                    logger.critical(
+                        "Telegram getMe failed after %d attempts: %s. "
+                        "Check network connectivity and Telegram API availability.",
+                        self._TELEGRAM_VERIFY_RETRIES, exc,
+                    )
+                    sys.exit(1)
+        # unreachable, but keeps type checkers happy
+        sys.exit(1)  # pragma: no cover
+
     async def _wait_for_ha(self) -> tuple[str, bool]:
         """Try to reach HA Core with exponential backoff.
 
@@ -355,7 +435,8 @@ class TelegramBot:
                 else:
                     if attempt < _READINESS_MAX_ATTEMPTS:
                         logger.warning(
-                            "HA not ready (attempt %d/%d), retrying in %.0fs...",
+                            "HA not ready — possibly booting or proxy returning 502 "
+                            "(attempt %d/%d), retrying in %.0fs...",
                             attempt, _READINESS_MAX_ATTEMPTS, delay,
                         )
                         await asyncio.sleep(delay)
@@ -504,12 +585,9 @@ class TelegramBot:
             self._recovery_loop(), name="ha_recovery",
         )
 
-        # Bot identity
-        try:
-            me = await self._bot.get_me()
-            logger.info("Bot initialized — @%s (id=%s)", me.username, me.id)
-        except Exception:
-            logger.warning("Could not fetch bot info via getMe")
+        # -- Telegram pre-flight: verify token via getMe before polling --
+        me = await self._verify_telegram_token()
+        logger.info("Bot initialized — @%s (id=%s)", me.username, me.id)
 
         # Auth mode log
         chat_mode = (
@@ -572,6 +650,8 @@ async def main() -> None:
     bot = TelegramBot(config, supervisor_token)
     try:
         await bot.run()
+    except SystemExit:
+        raise
     except asyncio.CancelledError:
         logger.info("Cancelled — shutting down")
     except Exception:

@@ -7,6 +7,7 @@ global rate limiter, UI builders, snapshot diff, storage CRUD.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import sys
 import time
@@ -1308,3 +1309,177 @@ class TestSyncDiff:
         removed = old - new
         assert len(added) == 3
         assert removed == set()
+
+
+# ---------------------------------------------------------------------------
+# Token validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestTokenValidation:
+    """Tests for bot_token validation in _load_and_validate_config."""
+
+    def _write_options(self, tmp_path: Path, options: dict) -> Path:
+        opts_file = tmp_path / "options.json"
+        opts_file.write_text(json.dumps(options), encoding="utf-8")
+        return opts_file
+
+    def test_empty_token_exits(self, tmp_path: Path, monkeypatch) -> None:
+        """Empty bot_token causes sys.exit(1)."""
+        import app as app_mod
+        opts = self._write_options(tmp_path, {"bot_token": ""})
+        monkeypatch.setattr(app_mod, "OPTIONS_PATH", opts)
+        with pytest.raises(SystemExit) as exc_info:
+            app_mod._load_and_validate_config()
+        assert exc_info.value.code == 1
+
+    def test_missing_token_exits(self, tmp_path: Path, monkeypatch) -> None:
+        """Missing bot_token key causes sys.exit(1)."""
+        import app as app_mod
+        opts = self._write_options(tmp_path, {})
+        monkeypatch.setattr(app_mod, "OPTIONS_PATH", opts)
+        with pytest.raises(SystemExit) as exc_info:
+            app_mod._load_and_validate_config()
+        assert exc_info.value.code == 1
+
+    def test_whitespace_only_token_exits(self, tmp_path: Path, monkeypatch) -> None:
+        """Whitespace-only bot_token causes sys.exit(1)."""
+        import app as app_mod
+        opts = self._write_options(tmp_path, {"bot_token": "   \n  "})
+        monkeypatch.setattr(app_mod, "OPTIONS_PATH", opts)
+        with pytest.raises(SystemExit) as exc_info:
+            app_mod._load_and_validate_config()
+        assert exc_info.value.code == 1
+
+    def test_malformed_token_exits(self, tmp_path: Path, monkeypatch) -> None:
+        """Token without digits:alnum format causes sys.exit(1)."""
+        import app as app_mod
+        opts = self._write_options(tmp_path, {"bot_token": "not-a-valid-token"})
+        monkeypatch.setattr(app_mod, "OPTIONS_PATH", opts)
+        with pytest.raises(SystemExit) as exc_info:
+            app_mod._load_and_validate_config()
+        assert exc_info.value.code == 1
+
+    def test_valid_token_with_whitespace_stripped(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Token with surrounding whitespace is stripped and accepted."""
+        import app as app_mod
+        token = "123456789:ABCDefGH_ijklmnop-QRS"
+        opts = self._write_options(tmp_path, {
+            "bot_token": f"  {token}  \n",
+        })
+        monkeypatch.setattr(app_mod, "OPTIONS_PATH", opts)
+        monkeypatch.setenv("SUPERVISOR_TOKEN", "fake-supervisor")
+        config, _ = app_mod._load_and_validate_config()
+        assert config.bot_token == token
+
+    def test_quoted_token_unquoted(self, tmp_path: Path, monkeypatch) -> None:
+        """Token wrapped in quotes is properly unquoted."""
+        import app as app_mod
+        token = "123456789:ABCDefGH_ijklmnop-QRS"
+        opts = self._write_options(tmp_path, {
+            "bot_token": f'"{token}"',
+        })
+        monkeypatch.setattr(app_mod, "OPTIONS_PATH", opts)
+        monkeypatch.setenv("SUPERVISOR_TOKEN", "fake-supervisor")
+        config, _ = app_mod._load_and_validate_config()
+        assert config.bot_token == token
+
+    def test_non_string_token_exits(self, tmp_path: Path, monkeypatch) -> None:
+        """Non-string bot_token (e.g. int) causes sys.exit(1)."""
+        import app as app_mod
+        opts = self._write_options(tmp_path, {"bot_token": 12345})
+        monkeypatch.setattr(app_mod, "OPTIONS_PATH", opts)
+        with pytest.raises(SystemExit) as exc_info:
+            app_mod._load_and_validate_config()
+        assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Telegram pre-flight verification tests
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyTelegramToken:
+    """Tests for _verify_telegram_token method."""
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_exits(self) -> None:
+        """TelegramUnauthorizedError causes immediate exit."""
+        import app as app_mod
+        from aiogram.exceptions import TelegramUnauthorizedError
+
+        bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+        bot._bot = MagicMock()
+        bot._bot.get_me = AsyncMock(
+            side_effect=TelegramUnauthorizedError(
+                method=MagicMock(), message="Unauthorized",
+            ),
+        )
+        bot._config = MagicMock()
+        bot._config.bot_token = "123456:FAKE"
+
+        with pytest.raises(SystemExit) as exc_info:
+            await bot._verify_telegram_token()
+        assert exc_info.value.code == 1
+        # Should NOT retry on Unauthorized
+        assert bot._bot.get_me.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_success_returns_user(self) -> None:
+        """Successful getMe returns the user object."""
+        import app as app_mod
+
+        bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+        bot._bot = MagicMock()
+        fake_user = MagicMock()
+        fake_user.username = "test_bot"
+        fake_user.id = 12345
+        bot._bot.get_me = AsyncMock(return_value=fake_user)
+        bot._config = MagicMock()
+        bot._config.bot_token = "123456:FAKE"
+
+        result = await bot._verify_telegram_token()
+        assert result is fake_user
+        assert result.username == "test_bot"
+
+    @pytest.mark.asyncio
+    async def test_transient_error_retries_then_succeeds(self) -> None:
+        """Network errors retry and succeed on subsequent attempt."""
+        import app as app_mod
+
+        bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+        bot._bot = MagicMock()
+        fake_user = MagicMock()
+        bot._bot.get_me = AsyncMock(
+            side_effect=[ConnectionError("timeout"), fake_user],
+        )
+        bot._config = MagicMock()
+        bot._config.bot_token = "123456:FAKE"
+        # Speed up for test
+        bot._TELEGRAM_VERIFY_BACKOFF = 0.01
+
+        result = await bot._verify_telegram_token()
+        assert result is fake_user
+        assert bot._bot.get_me.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_all_transient_errors_exits(self) -> None:
+        """All attempts failing with transient errors causes exit."""
+        import app as app_mod
+
+        bot = app_mod.TelegramBot.__new__(app_mod.TelegramBot)
+        bot._bot = MagicMock()
+        bot._bot.get_me = AsyncMock(
+            side_effect=ConnectionError("timeout"),
+        )
+        bot._config = MagicMock()
+        bot._config.bot_token = "123456:FAKE"
+        bot._TELEGRAM_VERIFY_BACKOFF = 0.01
+        bot._TELEGRAM_VERIFY_RETRIES = 3
+
+        with pytest.raises(SystemExit) as exc_info:
+            await bot._verify_telegram_token()
+        assert exc_info.value.code == 1
+        assert bot._bot.get_me.call_count == 3
