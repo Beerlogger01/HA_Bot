@@ -615,7 +615,7 @@ class TelegramBot:
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
 
         mode_label = "degraded" if not self._ha_ready else "full"
-        logger.info("Bot polling started (v2.3.4, mode=%s)", mode_label)
+        logger.info("Bot polling started (v2.3.5, mode=%s)", mode_label)
 
         await self._dp.start_polling(
             self._bot,
