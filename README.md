@@ -119,7 +119,7 @@ See [official Roborock documentation](https://www.home-assistant.io/integrations
 
 New authorized users retain the existing `user` default. Configured `admin_user_ids` bootstrap admin roles on every start; removing an ID from that option does not erase its stored role. To revoke it, remove it from the option and use `/role ID user` (or guest). Allowlist restrictions always apply, including to admins.
 
-Unlock, automation changes, whole-home light colors, scripts, vacuum room/routine launches, saved actions and schedule toggles require a screen-bound confirmation. Automation one-shot runs preserve HA conditions (`skip_condition: false`). Existing schedules are reauthorized at execution. The service boundary rejects arbitrary service names, broad HA targets and mismatched domains. All service attempts are audited. `/terminal` executes inside the add-on container and remains disabled by default.
+Unlock, automation changes, whole-home light colors, scenes/scripts, vacuum room/routine launches, saved actions and schedule toggles require a screen-bound confirmation. Automation one-shot runs preserve HA conditions (`skip_condition: false`). Existing schedules are reauthorized at execution. The service boundary rejects arbitrary service names, broad HA targets and mismatched domains. All service attempts are audited. `/terminal` executes inside the add-on container and remains disabled by default.
 
 ## Development and validation
 

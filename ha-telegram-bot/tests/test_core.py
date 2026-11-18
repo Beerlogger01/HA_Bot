@@ -702,7 +702,8 @@ class TestActiveNowMenu:
     def test_empty(self) -> None:
         from ui import build_active_now_menu
         text, kb = build_active_now_menu([])
-        assert "Всё выключено" in text
+        assert "Активные сейчас" in text
+        assert "Всё выключено" not in text
         # Should have refresh + back
         assert len(kb.inline_keyboard) == 2
 

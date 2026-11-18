@@ -160,7 +160,7 @@ def build_main_menu(
         if unavailable:
             lines.append(f"⚠ Недоступно: {unavailable}")
     else:
-        lines.append("Устройства появятся после подключения Home Assistant.")
+        lines.append("Нет отображаемых устройств. Проверьте фильтры и синхронизацию с Home Assistant.")
     rows = []
     # A direct explicit on/off action avoids surprising toggles on stale screens.
     for eid in (favorites or [])[:3]:
@@ -221,7 +221,7 @@ def build_active_now_menu(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Show entities that are currently in an active state."""
     if not entities:
-        text = "\U0001f7e2 <b>Активные сейчас</b>\n\nВсё выключено."
+        text = "\U0001f7e2 <b>Активные сейчас</b>\n\nНет устройств с подтверждённым активным состоянием."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:active")],
             [_home_btn()],

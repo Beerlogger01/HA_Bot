@@ -757,3 +757,22 @@ async def test_shared_widget_edit_pacing(env, monkeypatch):
     await api.edit_shared("widget1", "{}")
     await api.edit_shared("widget1", "{}")
     sleep.assert_awaited_once_with(1.0)
+
+
+async def test_scene_launch_requires_confirmation(env):
+    env.ha.states["scene.evening"] = {"entity_id": "scene.evening", "state": "unknown", "attributes": {"friendly_name": "Evening"}}
+    await env.h.cmd_start(message(env))
+    await show(env, "qsc:scene.evening")
+    await click(env, "qsc:scene.evening")
+    assert not env.ha.calls
+    assert "Evening" in [x[1]["text"] for x in env.tg.calls if x[0] == "editMessageText"][-1]
+    await click(env, "confirm:qsc:scene.evening")
+    assert env.ha.calls[-1][:2] == ("scene", "turn_on")
+
+
+async def test_hidden_only_home_does_not_claim_ha_is_offline(env):
+    from registry import EntityInfo
+    for eid in env.ha.states:
+        env.h._reg.entities[eid] = EntityInfo(entity_id=eid, hidden_by="user")
+    text, _ = await env.h._home_view(1)
+    assert "Home Assistant недоступен" not in text

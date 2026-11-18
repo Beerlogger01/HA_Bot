@@ -337,6 +337,7 @@ class Handlers:
             states = await self._ha.list_states()
         except Exception:
             states = []
+        online = bool(states)
         favorites = await self._db.get_favorites(uid)
         preferred = set(self._cfg.status_entities) | set(favorites)
         visible = []
@@ -347,7 +348,7 @@ class Handlers:
                 continue
             visible.append(state)
         states = sorted(visible, key=lambda x: x.get("entity_id") not in preferred)
-        return build_main_menu(states, favorites, online=bool(states))
+        return build_main_menu(states, favorites, online=online)
 
     async def _domain(self, cid, uid, uname, data, cb):
         parts = data.split(":")
@@ -856,7 +857,7 @@ class Handlers:
 
         sensitive = (prefix in {"gcl", "atrig", "atog", "fa_run", "rtn", "vseg", "schtog"} or
                      (prefix in {"act", "nact", "quick", "qsc"} and
-                      (data.endswith(":unlock") or data.split(":")[1].startswith(("script.", "automation.")))))
+                      (data.endswith(":unlock") or data.split(":")[1].startswith(("script.", "scene.", "automation.")))))
         if sensitive and not confirmed:
             await callback.answer()
             kb = InlineKeyboardMarkup(inline_keyboard=[
