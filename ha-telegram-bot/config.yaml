@@ -1,7 +1,7 @@
 name: "Home Assistant Telegram Bot"
-version: "2.3.7"
+version: "2.4.0"
 slug: ha_telegram_bot
-description: "Interactive Telegram bot with dynamic HA mirroring (floors/areas/devices), vacuum room targeting, Roborock routines, media player controls, full domain support, favorites with pinned items, notifications with completion events, search, snapshots, scheduler, diagnostics, role-based access control, and dynamic device discovery for Home Assistant"
+description: "Interactive Telegram bot with dynamic HA mirroring (floors/areas/devices), vacuum room targeting, Roborock routines, media player controls, full domain support, favorites with pinned items, notifications of reported state changes, search, snapshots, scheduler, diagnostics, role-based access control, and dynamic device discovery for Home Assistant"
 image: "ghcr.io/beerlogger01/ha-bot-ha-telegram-bot-{arch}"
 arch:
   - amd64
@@ -19,6 +19,7 @@ options:
   bot_token: ""
   allowed_chat_id: 0
   allowed_user_ids: []
+  admin_user_ids: []
   cooldown_seconds: 2
   cooldown_seconds_default: 2.0
   cooldown_overrides:
@@ -41,6 +42,11 @@ options:
     - number
     - lock
     - water_heater
+    - humidifier
+    - binary_sensor
+    - button
+    - input_boolean
+    - todo
     - sensor
   menu_page_size: 8
   show_all_enabled: false
@@ -63,11 +69,15 @@ options:
       url: "https://ep256.hostingradio.ru:8052/europaplus256.mp3"
   device_overrides: []
   terminal_enabled: false
+  widgets_enabled: false
+  widgets_retry_seconds: 3600
 
 schema:
   bot_token: password
   allowed_chat_id: int?
   allowed_user_ids:
+    - int?
+  admin_user_ids:
     - int?
   cooldown_seconds: int(1,60)?
   cooldown_seconds_default: float?
@@ -99,4 +109,7 @@ schema:
       idle_states:
         - str?
       running_threshold_watts: float?
+      max_report_age_seconds: int(60,31536000)?
   terminal_enabled: bool?
+  widgets_enabled: bool?
+  widgets_retry_seconds: int(60,86400)?

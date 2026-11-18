@@ -1724,5 +1724,6 @@ class TestControlButtonsDomainHandling:
         from ui import _control_buttons
         rows = _control_buttons("switch", "switch.light", "on", {})
         all_cbs = [btn.callback_data for row in rows for btn in row]
-        assert any("turn_on" in cb for cb in all_cbs)
-        assert any("turn_off" in cb for cb in all_cbs)
+        assert all_cbs == ["act:switch.light:turn_off"]
+        off = _control_buttons("switch", "switch.light", "off", {})
+        assert off[0][0].callback_data == "act:switch.light:turn_on"

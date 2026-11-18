@@ -109,7 +109,8 @@ def _build_notif_buttons(
 class NotificationManager:
     """Background WebSocket listener for state_changed events."""
 
-    def __init__(self, supervisor_token: str, db: Database, bot: Bot) -> None:
+    def __init__(self, supervisor_token: str, db: Database, bot: Bot, config=None) -> None:
+        self._config = config
         self._token = supervisor_token
         self._db = db
         self._bot = bot
@@ -155,7 +156,7 @@ class NotificationManager:
         self._subscribed = False
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
-                HA_WS_URL, timeout=aiohttp.ClientTimeout(total=0), heartbeat=30
+                HA_WS_URL, timeout=aiohttp.ClientWSTimeout(ws_receive=None, ws_close=10), heartbeat=30
             ) as ws:
                 # Auth
                 msg = await asyncio.wait_for(ws.receive(), timeout=10)
@@ -230,6 +231,9 @@ class NotificationManager:
                 continue
 
             user_id = sub["user_id"]
+            allowed = getattr(self._config, "allowed_user_ids", ())
+            if allowed and user_id not in allowed:
+                continue
 
             # Check mute
             if await self._db.is_muted(user_id, entity_id):
@@ -270,7 +274,7 @@ class NotificationManager:
             domain = entity_id.split(".", 1)[0]
             completion_line = ""
             if domain == "vacuum" and old_val in ("cleaning", "returning") and new_val in ("docked", "idle"):
-                completion_line = "\u2705 Уборка завершена!\n"
+                completion_line = "Home Assistant сообщает: пылесос больше не убирает.\n"
             elif domain == "vacuum" and new_val == "error":
                 error_msg = new_state.get("attributes", {}).get("error", "")
                 completion_line = f"\u274c Ошибка: {_sanitize(str(error_msg)[:100])}\n" if error_msg else "\u274c Ошибка!\n"
@@ -293,7 +297,7 @@ class NotificationManager:
                     ov = old_attrs.get(attr)
                     nv = new_attrs.get(attr)
                     if ov != nv:
-                        changes.append(f"  {attr}: {ov} \u2192 {nv}")
+                        changes.append(f"  {_sanitize(attr)}: {_sanitize(str(ov))} \u2192 {_sanitize(str(nv))}")
                 if changes:
                     text += "\n" + "\n".join(changes)
 
@@ -310,12 +314,14 @@ class NotificationManager:
     ) -> None:
         """Send notification message to user."""
         try:
-            await self._bot.send_message(
+            sent = await self._bot.send_message(
                 chat_id=user_id,
                 text=text,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
+            actions = [b.callback_data for row in reply_markup.inline_keyboard for b in row if b.callback_data] if reply_markup else []
+            await self._db.save_notice(user_id, sent.message_id, actions)
         except TelegramRetryAfter as e:
             logger.warning("Notification rate limited, wait %ss for user %s", e.retry_after, user_id)
             await asyncio.sleep(e.retry_after)

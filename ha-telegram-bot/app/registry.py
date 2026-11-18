@@ -91,6 +91,7 @@ class EntityInfo:
     disabled_by: str | None = None
     hidden_by: str | None = None
     translation_key: str | None = None
+    options: dict[str, Any] = field(default_factory=dict)
     entity_category: str | None = None  # "diagnostic", "config", or None (primary)
 
 
@@ -162,7 +163,7 @@ class HARegistry:
         """Connect to HA WS, fetch registries, build all mappings."""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(HA_WS_URL, timeout=aiohttp.ClientTimeout(total=30)) as ws:
+                async with session.ws_connect(HA_WS_URL, timeout=aiohttp.ClientWSTimeout(ws_receive=30, ws_close=10)) as ws:
                     # --- auth handshake ---
                     msg = await asyncio.wait_for(ws.receive(), timeout=10)
                     if msg.type != aiohttp.WSMsgType.TEXT:
@@ -275,6 +276,7 @@ class HARegistry:
                     hidden_by=item.get("hidden_by"),
                     translation_key=item.get("translation_key"),
                     entity_category=item.get("entity_category"),
+                    options=item.get("options", {}),
                 )
 
     # -------------------------------------------------------------------
@@ -337,7 +339,7 @@ class HARegistry:
         })
         _ROUTINE_KW = frozenset({
             "routine", "scenario", "сценарий", "рутин", "scene",
-            "clean", "уборк", "mop", "program", "schedule",
+            "program",
         })
 
         for ent in self.entities.values():
@@ -359,7 +361,7 @@ class HARegistry:
             )
 
             # Include non-system buttons and all routine-heuristic buttons
-            if is_routine or not is_system:
+            if is_routine and not is_system and not ent.entity_category:
                 self.vacuum_routines.setdefault(vacuum_eid, []).append(ent.entity_id)
 
         for vac_eid, btns in self.vacuum_routines.items():
@@ -370,48 +372,20 @@ class HARegistry:
     # -------------------------------------------------------------------
 
     async def _detect_vacuum_segments(self) -> None:
-        """Try to import vacuum room segments.  Best-effort, never crashes."""
-        for vac_eid, platform in self.vacuum_platforms.items():
-            logger.info(
-                "Vacuum %s platform=%s — attempting segment import",
-                vac_eid, platform,
-            )
-            # For Roborock integration, segments may come from select entities
-            # on the same device, or from vacuum attributes.
-            # We look for number/select entities with 'segment' or 'room' in name.
-            device_id = self.entities.get(vac_eid, EntityInfo(entity_id=vac_eid)).device_id
-            if not device_id:
-                logger.info("Vacuum %s has no device_id, skipping segment import", vac_eid)
+        """Import only explicit HA area mappings; never infer room IDs from names.
+
+        Mapping belongs to HA's vacuum registry options (Core 2026.11+). Older
+        installations retain their explicit numeric room map in SQLite.
+        """
+        for vac_eid in self.vacuum_platforms:
+            entry = self.entities[vac_eid]
+            mapping = entry.options.get("vacuum", {}).get("area_mapping")
+            if not isinstance(mapping, dict):
                 continue
-
-            segments: list[dict[str, Any]] = []
-
-            # Heuristic 1: look for entities with rooms/segments info in the entity_id
-            # e.g. select.roborock_s7_rooms, number.roborock_s7_room_*
-            for ent in self.entities.values():
-                if ent.device_id != device_id:
-                    continue
-                if ent.disabled_by:
-                    continue
-                eid_lower = ent.entity_id.lower()
-                name_lower = _normalize(ent.original_name or ent.name or "")
-                # Roborock often has entities like sensor.roborock_*_room_*
-                # or the vacuum attributes contain room info
-                # We collect "room" related entities but this is best-effort
-                if "room" in eid_lower or "segment" in eid_lower:
-                    logger.debug("Segment candidate entity: %s", ent.entity_id)
-
-            # Heuristic 2: use configured vacuum_room_presets (from config)
-            # This is handled at the handler level, not here
-
-            if segments:
-                await self._db.save_vacuum_room_map(vac_eid, segments)
-                logger.info("Vacuum %s: imported %d segments", vac_eid, len(segments))
-            else:
-                logger.info(
-                    "Vacuum %s: no segments auto-detected (room cleaning via presets or unavailable)",
-                    vac_eid,
-                )
+            rooms = [{"segment_id": "area:" + area_id, "segment_name": self.areas[area_id].name}
+                     for area_id, segments in mapping.items()
+                     if area_id in self.areas and isinstance(segments, list) and segments]
+            await self._db.save_vacuum_room_map(vac_eid, rooms)
 
     # -------------------------------------------------------------------
     # Persist entity -> area cache in DB

@@ -14,13 +14,14 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from api import HAClient
 from diagnostics import Diagnostics
@@ -28,6 +29,8 @@ from registry import HARegistry
 from scheduler import Scheduler, next_cron_time, validate_cron
 from state_mapping import map_state
 from storage import Database
+from actions import validate_service
+from sessions import SessionState, current_session, personal_entry
 from ui import (
     COLOR_PRESETS,
     build_active_now_menu,
@@ -46,6 +49,7 @@ from ui import (
     build_help_menu,
     build_light_color_menu,
     build_main_menu,
+    build_more_menu,
     build_media_source_menu,
     build_notif_list,
     build_radio_menu,
@@ -65,6 +69,7 @@ from ui import (
     sort_entities_for_device,
 )
 from vacuum_adapter import VacuumAdapter
+from widget_ui import WidgetUI
 
 logger = logging.getLogger("ha_bot.handlers")
 
@@ -89,12 +94,12 @@ _ROLE_LEVELS: dict[str, int] = {"admin": 3, "user": 2, "guest": 1}
 
 # Write-action callback prefixes that require at least "user" role
 _WRITE_PREFIXES: frozenset[str] = frozenset({
-    "act", "bright", "clim", "fav", "ntog", "vseg", "vcmd", "rtn",
+    "quick", "act", "bright", "clim", "fav", "ntog", "vseg", "vcmd", "rtn",
     "nact", "nmute", "fa_run", "fa_del", "schtog", "schdel", "snapdel",
     "mvol", "mmut", "msrs", "ssel", "nval", "pin",
     "qsc", "lcs", "gcl", "rad", "rout",
-    "atog", "atrig",  # automations
-    "tdc", "tdd",     # to-do complete/delete
+    "atog", "atrig", "humi", "hmode",  # automations / humidity
+    "tdc", "tdd", "tda",     # to-do complete/delete
 })
 
 # Prefixes exempt from idempotency guard (debounce-eligible rapid taps)
@@ -170,13 +175,14 @@ class Handlers:
         self._sched = scheduler
         self._device_overrides = getattr(config, "device_overrides", {})
         self.ha_version: str = "unknown"
+        self.widgets = WidgetUI(bot, db, config, self)
 
         # In-memory search result cache: chat_id -> entity list
-        self._search_cache: dict[int, list[dict[str, Any]]] = {}
+        self._search_cache = SessionState("search")
         # Navigation breadcrumb stack: chat_id -> [callback, ...]
-        self._nav_stack: dict[int, list[str]] = {}
+        self._nav_stack = SessionState("navigation")
         # Radio state per chat: chat_id -> {station_idx, player_eid, playing}
-        self._radio_state: dict[int, dict[str, Any]] = {}
+        self._radio_state = SessionState("radio")
 
         # Per-user callback serialization lock
         self._user_locks: dict[int, asyncio.Lock] = {}
@@ -189,7 +195,7 @@ class Handlers:
         self._debounce_tasks: dict[tuple[int, int, str], asyncio.Task[None]] = {}
 
         # To-do: pending add item state: chat_id -> list_entity_id
-        self._todo_add_pending: dict[int, str] = {}
+        self._todo_add_pending = SessionState("todo")
 
     # -----------------------------------------------------------------------
     # Security
@@ -204,7 +210,7 @@ class Handlers:
     async def _check_role(self, user_id: int, min_role: str) -> bool:
         """Check if user has at least min_role level."""
         role = await self._db.get_user_role(user_id)
-        return _ROLE_LEVELS.get(role, 2) >= _ROLE_LEVELS.get(min_role, 2)
+        return _ROLE_LEVELS.get(role, 0) >= _ROLE_LEVELS.get(min_role, 2)
 
     @staticmethod
     def _extract_user(obj: Message | CallbackQuery) -> tuple[int | None, str]:
@@ -230,44 +236,161 @@ class Handlers:
         menu: str = "main", entity: str | None = None, room: str | None = None,
         thread_id: int | None = None,
     ) -> None:
-        msg_id = await self._db.get_menu_message_id(chat_id)
-
+        session = current_session.get()
+        if session is None or session.chat_id != chat_id:
+            raise RuntimeError("Rendering requires an authorized personal session")
+        state = session.data
+        receipt = state.pop("service_receipt", None)
+        if receipt:
+            text += "\n\n<i>" + self._sanitize(receipt) + "</i>"
+        if len(text) > 3900:
+            from widget_ui import plain
+            text = self._sanitize(plain(text)[:3000]) + "\n… Откройте отдельную карточку для подробностей."
+        role = await self._db.get_user_role(session.user_id)
+        rows = [[b for b in row if self._visible_action(b.callback_data or "", role)] for row in kb.inline_keyboard]
+        kb = InlineKeyboardMarkup(inline_keyboard=[row for row in rows if row])
+        if state.get("mode") == "widget":
+            if await self.widgets.render(session, text, kb):
+                state.update(current_menu=menu, selected_entity=entity, selected_room=room)
+                if menu != "todo_add":
+                    self._todo_add_pending.pop(chat_id, None)
+                await self._db.save_ui_session(*session.key, state)
+                return
+            state["mode"] = "inline"
+            text += "\n\nWidgets сейчас недоступны. Открыто обычное меню."
+        state.pop("widget_actions", None)
+        nonce = secrets.token_hex(5)
+        actions = {}
+        rows = []
+        for row in kb.inline_keyboard:
+            bound = []
+            for button in row:
+                if button.callback_data:
+                    key = f"u:{nonce}:{len(actions)}"
+                    actions[key] = button.callback_data
+                    button = button.model_copy(update={"callback_data": key})
+                bound.append(button)
+            rows.append(bound)
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        msg_id = state.get("message_id")
         if msg_id is not None:
             try:
                 await self._bot.edit_message_text(
                     text=text, chat_id=chat_id, message_id=msg_id,
-                    parse_mode="HTML", reply_markup=kb,
+                    parse_mode="HTML", reply_markup=keyboard,
                 )
-                await self._db.save_menu_state(chat_id, msg_id, menu, entity, room)
+            except TelegramRetryAfter:
+                return  # Keep the old screen and its valid buttons.
+            except TelegramForbiddenError:
                 return
-            except TelegramRetryAfter as e:
-                logger.warning("Rate limited %ss", e.retry_after)
-                return
-            except (TelegramBadRequest, TelegramForbiddenError):
-                try:
-                    await self._bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                except (TelegramBadRequest, TelegramForbiddenError):
-                    pass
-
-        if source is not None:
+            except TelegramBadRequest as exc:
+                if "message is not modified" not in str(exc).lower():
+                    if "message to edit not found" not in str(exc).lower() and "message can't be edited" not in str(exc).lower():
+                        logger.warning("Menu edit rejected")
+                        return
+                    msg_id = None
+        if msg_id is None:
             try:
-                await source.delete()
-            except (TelegramBadRequest, TelegramForbiddenError):
-                pass
+                sent = await self._bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard,
+                    message_thread_id=session.thread_id or None,
+                )
+                msg_id = sent.message_id
+            except (TelegramRetryAfter, TelegramBadRequest, TelegramForbiddenError):
+                logger.warning("Menu send failed")
+                return
+        state.update(message_id=msg_id, current_menu=menu, selected_entity=entity,
+                     selected_room=room, actions=actions)
+        if menu != "todo_add":
+            self._todo_add_pending.pop(chat_id, None)
+        await self._db.save_ui_session(*session.key, state)
 
+    @staticmethod
+    def _visible_action(data, role):
+        prefix = data.split(":", 1)[0]
+        if role not in {"admin", "user"} and prefix in _WRITE_PREFIXES:
+            return False
+        if role != "admin" and (prefix in {"gcl", "atog", "atrig", "diag"}
+                or data in {"menu:diag", "menu:refresh", "menu:gcolor"}
+                or (prefix in {"act", "nact"} and ":lock." in data)):
+            return False
+        return True
+
+    @personal_entry
+    async def cmd_widgets(self, message):
+        session = current_session.get()
+        if not getattr(self._cfg, "widgets_enabled", False):
+            await message.answer("Widgets отключены в настройках add-on. /menu — обычное меню.")
+            return
+        session.data["mode"] = "widget"
+        t, k = await self._home_view(session.user_id)
+        await self._send_or_edit(session.chat_id, t, k, menu="main")
+
+    async def _ui_mode(self, cid, uid, uname, data, cb):
+        current_session.get().data["mode"] = "inline"
+        await cb.answer()
+        t, k = await self._home_view(uid)
+        await self._send_or_edit(cid, t, k, menu="main")
+
+    async def _home_view(self, uid):
         try:
-            kwargs: dict[str, Any] = {
-                "chat_id": chat_id, "text": text,
-                "parse_mode": "HTML", "reply_markup": kb,
-            }
-            if thread_id is not None:
-                kwargs["message_thread_id"] = thread_id
-            sent = await self._bot.send_message(**kwargs)
-            await self._db.save_menu_state(chat_id, sent.message_id, menu, entity, room)
-        except TelegramRetryAfter as e:
-            logger.warning("Rate limited on send %ss", e.retry_after)
-        except (TelegramBadRequest, TelegramForbiddenError) as exc:
-            logger.error("Failed to send menu: %s", exc)
+            states = await self._ha.list_states()
+        except Exception:
+            states = []
+        favorites = await self._db.get_favorites(uid)
+        preferred = set(self._cfg.status_entities) | set(favorites)
+        visible = []
+        for state in states:
+            eid = state.get("entity_id", "")
+            entry = self._reg.entities.get(eid)
+            if eid not in preferred and entry and (entry.disabled_by or entry.hidden_by or entry.entity_category):
+                continue
+            visible.append(state)
+        states = sorted(visible, key=lambda x: x.get("entity_id") not in preferred)
+        return build_main_menu(states, favorites, online=bool(states))
+
+    async def _domain(self, cid, uid, uname, data, cb):
+        parts = data.split(":")
+        domain = parts[1]
+        page = int(parts[2]) if len(parts) > 2 else 0
+        states = await self._ha.list_states()
+        entities = [{**x, "friendly_name": x.get("attributes", {}).get("friendly_name", x["entity_id"])}
+                    for x in states if x["entity_id"].split(".")[0] in ({"climate", "humidifier", "water_heater"} if domain == "climate" else {domain})]
+        from ui import DOMAIN_LABELS
+        t, k = build_entity_list(entities, page, self._cfg.menu_page_size,
+                                 f"<b>{DOMAIN_LABELS.get(domain, domain)}</b>", "nav:main", f"domain:{domain}")
+        await cb.answer()
+        await self._send_or_edit(cid, t, k, menu=f"domain:{domain}")
+
+    async def _humidity(self, cid, uid, uname, data, cb):
+        prefix, eid, value = data.split(":", 2)
+        state = await self._ha.get_state(eid)
+        if not state or not eid.startswith("humidifier."):
+            await cb.answer("Устройство недоступно", show_alert=True)
+            return
+        attrs = state.get("attributes", {})
+        if prefix == "hmode":
+            if value not in attrs.get("available_modes", []) or not int(attrs.get("supported_features", 0)) & 1:
+                await cb.answer("Режим недоступен", show_alert=True)
+                return
+            service, payload = "set_mode", {"mode": value}
+        else:
+            current = attrs.get("humidity")
+            if not isinstance(current, (int, float)):
+                await cb.answer("Целевая влажность неизвестна", show_alert=True)
+                return
+            target = max(attrs.get("min_humidity", 0), min(attrs.get("max_humidity", 100), current + (5 if value == "up" else -5)))
+            service, payload = "set_humidity", {"humidity": target}
+        ok, error = await self._ha.call_service("humidifier", service, {"entity_id": eid, **payload})
+        await cb.answer("Команда принята Home Assistant" if ok else str(error)[:180], show_alert=not ok)
+        await self._show_entity_control(cid, uid, eid)
+
+    async def _quick(self, cid, uid, uname, data, cb):
+        await self._action(cid, uid, uname, data, cb)
+
+    async def _menu_state(self, cid: int) -> dict:
+        session = current_session.get()
+        return session.data if session and session.chat_id == cid else {}
 
     # -----------------------------------------------------------------------
     # Rate limits
@@ -315,7 +438,12 @@ class Handlers:
     # Commands
     # -----------------------------------------------------------------------
 
+    @personal_entry
     async def cmd_start(self, message: Message) -> None:
+        session = current_session.get()
+        command = (message.text or "").split()[0].split("@")[0]
+        session.data["mode"] = "inline" if command == "/menu" else (
+            "widget" if getattr(self._cfg, "widgets_enabled", False) else "inline")
         uid, uname = self._extract_user(message)
         if uid is None:
             return
@@ -328,10 +456,11 @@ class Handlers:
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="/start", success=True)
         self._clear_nav(cid)
-        text, kb = build_main_menu()
+        text, kb = await self._home_view(uid)
         tid = self._get_thread_id(message)
         await self._send_or_edit(cid, text, kb, source=message, menu="main", thread_id=tid)
 
+    @personal_entry
     async def cmd_status(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -347,10 +476,12 @@ class Handlers:
         tid = self._get_thread_id(message)
         await self._send_or_edit(cid, text, kb, source=message, menu="status", thread_id=tid)
 
+    @personal_entry
     async def cmd_ping(self, message: Message) -> None:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         await message.answer(f"pong  |  HA {self.ha_version}  |  {ts}")
 
+    @personal_entry
     async def cmd_search(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -372,6 +503,7 @@ class Handlers:
 
         await self._do_search(cid, uid, query, message=message)
 
+    @personal_entry
     async def cmd_health(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -391,6 +523,7 @@ class Handlers:
         ]
         await message.answer("\n".join(lines), parse_mode="HTML")
 
+    @personal_entry
     async def cmd_diag(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -406,6 +539,7 @@ class Handlers:
         tid = self._get_thread_id(message)
         await self._send_or_edit(cid, text, kb, source=message, menu="diag", thread_id=tid)
 
+    @personal_entry
     async def cmd_trace(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -419,6 +553,7 @@ class Handlers:
         trace = await self._diag.trace_last_error()
         await message.answer(trace, parse_mode="HTML")
 
+    @personal_entry
     async def cmd_snapshot(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -440,10 +575,11 @@ class Handlers:
         ]
         snap_id = await self._db.save_snapshot(uid, snap_name, payload)
         await message.answer(
-            f"\U0001f4f8 Снимок <b>{snap_name}</b> сохранён (#{snap_id}, {len(payload)} сущностей).",
+            f"\U0001f4f8 Снимок <b>{self._sanitize(snap_name)}</b> сохранён (#{snap_id}, {len(payload)} сущностей).",
             parse_mode="HTML",
         )
 
+    @personal_entry
     async def cmd_snapshots(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -456,6 +592,7 @@ class Handlers:
         tid = self._get_thread_id(message)
         await self._send_or_edit(cid, text, kb, source=message, menu="snapshots", thread_id=tid)
 
+    @personal_entry
     async def cmd_schedule(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -507,19 +644,28 @@ class Handlers:
             return
 
         domain, service = service_str.split(".", 1)
+        role = await self._db.get_user_role(uid)
+        service_data = {"entity_id": entity_id}
+        if (domain, service) == ("automation", "trigger"):
+            service_data["skip_condition"] = False
+        error = validate_service(domain, service, service_data, role=role)
+        if error:
+            await message.answer(error)
+            return
         nr = next_cron_time(cron_expr)
         if nr == 0.0:
             await message.answer("\u274c Не удалось вычислить следующий запуск.")
             return
 
-        payload = {"domain": domain, "service": service, "data": {"entity_id": entity_id}}
+        payload = {"domain": domain, "service": service, "data": service_data}
         sched_id = await self._db.add_schedule(uid, name, "service_call", payload, cron_expr, nr)
         await message.answer(
-            f"\u2705 Расписание #{sched_id} <b>{name}</b> создано.\n"
+            f"\u2705 Расписание #{sched_id} <b>{self._sanitize(name)}</b> создано.\n"
             f"Cron: <code>{cron_expr}</code>",
             parse_mode="HTML",
         )
 
+    @personal_entry
     async def cmd_role(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -551,6 +697,7 @@ class Handlers:
         tid = self._get_thread_id(message)
         await self._send_or_edit(cid, text, kb, source=message, menu="roles", thread_id=tid)
 
+    @personal_entry
     async def cmd_export_settings(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -560,10 +707,10 @@ class Handlers:
             return
         data = await self._db.export_user_settings(uid)
         text = json.dumps(data, ensure_ascii=False, indent=2)
-        if len(text) > 4000:
-            text = text[:4000] + "\n... (truncated)"
-        await message.answer(f"<pre>{text}</pre>", parse_mode="HTML")
+        await message.answer_document(BufferedInputFile(text.encode("utf-8"), filename="ha-bot-settings.json"),
+                                      caption="Личные настройки. Для восстановления отправьте файл с подписью /import_settings.")
 
+    @personal_entry
     async def cmd_import_settings(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -571,8 +718,20 @@ class Handlers:
         cid = message.chat.id
         if not self._is_authorized_chat(cid):
             return
-        parts = (message.text or "").split(maxsplit=1)
+        parts = (message.text or message.caption or "").split(maxsplit=1)
         json_str = parts[1].strip() if len(parts) > 1 else ""
+        if message.document:
+            if (message.document.file_size or 0) > 1_000_000:
+                await message.answer("Файл настроек должен быть меньше 1 МБ.")
+                return
+            import io
+            buffer = io.BytesIO()
+            await self._bot.download(message.document, destination=buffer)
+            try:
+                json_str = buffer.getvalue().decode("utf-8")
+            except UnicodeDecodeError:
+                await message.answer("Нужен JSON-файл в UTF-8.")
+                return
         if not json_str:
             await message.answer(
                 "Использование: /import_settings {json}\nJSON из /export_settings",
@@ -583,9 +742,13 @@ class Handlers:
         except json.JSONDecodeError as exc:
             await message.answer(f"\u274c Некорректный JSON: {exc}")
             return
+        if not isinstance(data, dict):
+            await message.answer("Ожидается JSON-объект настроек.")
+            return
         count = await self._db.import_user_settings(uid, data)
-        await message.answer(f"\u2705 Импортировано: {count} записей.")
+        await message.answer(f"Импортировано: {count} записей. Восстановленные расписания выключены; включите нужные в меню.")
 
+    @personal_entry
     async def cmd_notify_test(self, message: Message) -> None:
         uid, uname = self._extract_user(message)
         if uid is None:
@@ -596,6 +759,7 @@ class Handlers:
         result = await self._diag.notify_test(self._bot, cid)
         await message.answer(result)
 
+    @personal_entry
     async def handle_text_search(self, message: Message) -> None:
         """Handle plain text messages as search queries or to-do add input."""
         uid, uname = self._extract_user(message)
@@ -629,7 +793,7 @@ class Handlers:
             await self._show_todo_items(cid, list_eid, 0)
             return
 
-        menu_state = await self._db.get_menu_state(cid)
+        menu_state = await self._menu_state(cid)
         if not menu_state or menu_state.get("current_menu") != "search":
             return
 
@@ -643,6 +807,7 @@ class Handlers:
     # Callback dispatcher
     # -----------------------------------------------------------------------
 
+    @personal_entry
     async def handle_callback(self, callback: CallbackQuery) -> None:
         if callback.message is None:
             await callback.answer("Сообщение устарело.", show_alert=True)
@@ -653,6 +818,9 @@ class Handlers:
             await callback.answer("Не удалось определить пользователя.", show_alert=True)
             return
         data = callback.data or ""
+        confirmed = data.startswith("confirm:")
+        if confirmed:
+            data = data[len("confirm:"):]
 
         if not self._is_authorized_chat(cid):
             await callback.answer("\u26d4 Неавторизованный чат.", show_alert=True)
@@ -665,12 +833,20 @@ class Handlers:
 
         # Idempotency guard: reject duplicate (uid, data) within 0.25s
         prefix = data.split(":", 1)[0] if ":" in data else data
-        now = time.time()
+        now = time.monotonic()
+        self._last_cb = {u: item for u, item in self._last_cb.items() if now - item[1] < 30}
         last = self._last_cb.get(uid)
-        if last and last[0] == data and (now - last[1]) < 0.25 and prefix not in _DEBOUNCE_PREFIXES:
+        if not confirmed and last and last[0] == (current_session.get().key, data) and (now - last[1]) < 0.25 and prefix not in _DEBOUNCE_PREFIXES:
             await callback.answer()
             return
-        self._last_cb[uid] = (data, now)
+        self._last_cb[uid] = ((current_session.get().key, data), now)
+
+        if (prefix in {"gcl", "atog", "atrig", "diag"}
+                or data in {"menu:diag", "menu:refresh", "menu:gcolor"}
+                or (prefix in {"act", "nact"} and data.split(":")[1].startswith("lock."))):
+            if not await self._check_role(uid, "admin"):
+                await callback.answer("Требуются права администратора.", show_alert=True)
+                return
 
         # Role check for write actions
         if prefix in _WRITE_PREFIXES:
@@ -678,18 +854,62 @@ class Handlers:
                 await callback.answer("\u26d4 Недостаточно прав (guest).", show_alert=True)
                 return
 
-        # Per-user lock to serialize callback handling
-        lock = self._user_locks.setdefault(uid, asyncio.Lock())
-        async with lock:
-            try:
-                handler = self._ROUTES.get(prefix)
-                if handler:
-                    await handler(self, cid, uid, uname, data, callback)
+        sensitive = (prefix in {"gcl", "atrig", "atog", "fa_run", "rtn", "vseg", "schtog"} or
+                     (prefix in {"act", "nact", "quick", "qsc"} and
+                      (data.endswith(":unlock") or data.split(":")[1].startswith(("script.", "automation.")))))
+        if sensitive and not confirmed:
+            await callback.answer()
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Подтвердить", callback_data=f"confirm:{data}")],
+                [InlineKeyboardButton(text="Отмена", callback_data="nav:main")],
+            ])
+            await self._send_or_edit(cid, await self._confirmation_text(uid, data), kb, menu="confirm")
+            return
+        try:
+            handler = self._ROUTES.get(prefix)
+            if handler:
+                if prefix in _WRITE_PREFIXES and hasattr(self._ha, "transaction"):
+                    async with self._ha.transaction():
+                        await handler(self, cid, uid, uname, data, callback)
                 else:
-                    await callback.answer("Неизвестное действие.", show_alert=True)
-            except Exception:
-                logger.exception("Callback error: %s", data)
-                await callback.answer("Произошла ошибка.", show_alert=True)
+                    await handler(self, cid, uid, uname, data, callback)
+            else:
+                await callback.answer("Неизвестное действие.", show_alert=True)
+        except Exception:
+            logger.exception("Callback error: %s", prefix)
+            await callback.answer("Не удалось выполнить действие. Обновите экран.", show_alert=True)
+
+    async def _confirmation_text(self, uid, data):
+        parts = data.split(":", 2)
+        prefix = parts[0]
+        if prefix == "gcl":
+            index = int(parts[1])
+            label = COLOR_PRESETS[index][0] if 0 <= index < len(COLOR_PRESETS) else "Неизвестный цвет"
+            description = f"Весь доступный цветной свет → {label}"
+        elif prefix in {"fa_run", "schtog"}:
+            items = await (self._db.get_favorite_actions(uid) if prefix == "fa_run" else self._db.get_schedules(uid))
+            item = next((item for item in items if item["id"] == int(parts[1])), {})
+            payload = item.get("payload", {})
+            label = item.get("label", item.get("name", "Действие"))
+            verb = "Запустить" if prefix == "fa_run" else ("Выключить расписание" if item.get("enabled") else "Включить расписание")
+            description = f"{verb}: {label}\n{payload.get('domain', '')}.{payload.get('service', '')} · {payload.get('data', {}).get('entity_id', '')}"
+        else:
+            eid = parts[1] if len(parts) > 1 else ""
+            state = await self._ha.get_state(eid)
+            name = (state or {}).get("attributes", {}).get("friendly_name", eid)
+            if prefix == "vseg":
+                rooms = await self._vac.get_rooms(eid)
+                action = "Убрать помещение: " + self._vac.get_segment_display_name(parts[2], rooms)
+            elif prefix == "atrig":
+                action = "Разовый запуск с проверкой условий"
+            elif prefix == "atog":
+                action = "Отключить автоматические запуски" if parts[-1] == "turn_off" else "Включить автоматические запуски"
+            elif prefix == "rtn":
+                action = "Запустить сценарий уборки"
+            else:
+                action = "Открыть замок" if parts[-1] == "unlock" else "Запустить действие"
+            description = f"{name}\n{action}"
+        return "<b>Подтвердите действие</b>\n" + self._sanitize(description) + "\n\nСостояние после выполнения определяется Home Assistant."
 
     # -----------------------------------------------------------------------
     # nav: — back navigation
@@ -700,7 +920,7 @@ class Handlers:
         await cb.answer()
         if target == "main":
             self._clear_nav(cid)
-            t, k = build_main_menu()
+            t, k = await self._home_view(uid)
             await self._send_or_edit(cid, t, k, menu="main")
         elif target == "manage" or target == "devices":
             await self._show_manage(cid)
@@ -712,7 +932,7 @@ class Handlers:
             # Re-dispatch the previous callback
             if prev == "nav:main":
                 self._clear_nav(cid)
-                t, k = build_main_menu()
+                t, k = await self._home_view(uid)
                 await self._send_or_edit(cid, t, k, menu="main")
             else:
                 # Simulate the callback by re-dispatching
@@ -721,10 +941,10 @@ class Handlers:
                 if handler:
                     await handler(self, cid, uid, uname, prev, cb)
                 else:
-                    t, k = build_main_menu()
+                    t, k = await self._home_view(uid)
                     await self._send_or_edit(cid, t, k, menu="main")
         else:
-            t, k = build_main_menu()
+            t, k = await self._home_view(uid)
             await self._send_or_edit(cid, t, k, menu="main")
 
     # -----------------------------------------------------------------------
@@ -735,7 +955,10 @@ class Handlers:
         target = data.split(":", 1)[1] if ":" in data else ""
         await cb.answer()
 
-        if target == "manage" or target == "devices":
+        if target == "more":
+            t, k = build_more_menu(await self._check_role(uid, "admin"))
+            await self._send_or_edit(cid, t, k, menu="more")
+        elif target == "manage" or target == "devices":
             self._push_nav(cid, "nav:main")
             await self._show_manage(cid)
         elif target == "scenarios":
@@ -844,7 +1067,7 @@ class Handlers:
         else:
             devices = self._reg.get_devices_for_area(area_id, domains, show_all=sa)
             area = self._reg.areas.get(area_id)
-            title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
+            title = f"\U0001f3e0 <b>{self._sanitize(area.name if area else area_id)}</b>"
 
         if not devices:
             t, k = build_confirmation(f"{title}\n\nНет устройств.", "nav:manage")
@@ -909,7 +1132,7 @@ class Handlers:
         else:
             devices = self._reg.get_devices_for_area(area_id, domains, show_all=sa)
             area = self._reg.areas.get(area_id)
-            title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
+            title = f"\U0001f3e0 <b>{self._sanitize(area.name if area else area_id)}</b>"
 
         pin_btn = None
         if area_id and area_id != "__none__":
@@ -980,7 +1203,7 @@ class Handlers:
 
         t, k = build_entity_list(
             ent_list, 0, self._cfg.menu_page_size,
-            title=f"\U0001f4e6 <b>{dev_name}</b>",
+            title=f"\U0001f4e6 <b>{self._sanitize(dev_name)}</b>",
             back_cb=back_cb,
             page_cb_prefix=f"dvp:{device_id}",
         )
@@ -1013,7 +1236,7 @@ class Handlers:
 
         t, k = build_entity_list(
             ent_list, page, self._cfg.menu_page_size,
-            title=f"\U0001f4e6 <b>{dev_name}</b>",
+            title=f"\U0001f4e6 <b>{self._sanitize(dev_name)}</b>",
             back_cb=back_cb,
             page_cb_prefix=f"dvp:{device_id}",
         )
@@ -1043,25 +1266,17 @@ class Handlers:
 
         self._push_nav(cid, back)
 
+        state = {**state, "max_report_age_seconds": self._device_overrides.get(eid, {}).get("max_report_age_seconds")}
         t, k = build_entity_control(eid, state, is_fav, is_notif, back)
+        entry = self._reg.entities.get(eid)
+        if entry and entry.device_id:
+            rows = k.inline_keyboard[:]
+            rows.insert(-1, [InlineKeyboardButton(text="Датчики и настройки устройства", callback_data=f"dvp:{entry.device_id}:0")])
+            k = InlineKeyboardMarkup(inline_keyboard=rows)
 
         domain = eid.split(".", 1)[0]
 
-        # For lights that support color, add color preset button
-        if domain == "light":
-            attrs = state.get("attributes", {})
-            color_modes = attrs.get("supported_color_modes", [])
-            if any(m in ("rgb", "rgbw", "rgbww", "hs", "xy") for m in color_modes):
-                rows = k.inline_keyboard[:]
-                insert_pos = max(0, len(rows) - 2)
-                rows.insert(insert_pos, [InlineKeyboardButton(
-                    text="\U0001f3a8 Цвет",
-                    callback_data=f"lclr:{eid}",
-                )])
-                k = InlineKeyboardMarkup(inline_keyboard=rows)
-
-        # For vacuum, add extra buttons (rooms, routines)
-        if domain == "vacuum":
+        if domain == "vacuum" and state.get("state") not in ("unknown", "unavailable"):
             extra_rows: list[list[InlineKeyboardButton]] = []
             try:
                 caps = await self._vac.get_capabilities(eid)
@@ -1116,14 +1331,16 @@ class Handlers:
         except Exception as exc:
             logger.exception("Service call %s.%s failed for %s", domain, service, eid)
             ok, err = False, str(exc)[:200]
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action=f"{domain}.{service}", entity_id=eid,
                      success=ok, error=err if not ok else None)
 
         if ok:
-            await self._show_entity_control(cid, uid, eid)
+            if data.startswith("quick:"):
+                t, k = await self._home_view(uid)
+                await self._send_or_edit(cid, t, k, menu="main")
+            else:
+                await self._show_entity_control(cid, uid, eid)
         else:
             # Explicit error — never silently ignore (especially for button.press / doorbell)
             err_msg = (err or "неизвестная ошибка")[:180]
@@ -1146,7 +1363,7 @@ class Handlers:
         if not await self._check_rl(uid, "light.brightness", cb):
             return
 
-        key = (cid, uid, eid)
+        key = (cid, uid, eid, current_session.get().thread_id if current_session.get() else 0)
 
         # Use pending value if mid-debounce, otherwise fetch HA state
         if key in self._pending_brightness:
@@ -1168,7 +1385,36 @@ class Handlers:
             existing.cancel()
         self._debounce_tasks[key] = asyncio.create_task(
             self._flush_brightness(key, cid, uid, uname, eid),
+            context=self._deferred_context(),
         )
+
+    def _deferred_context(self):
+        import contextvars
+        context = contextvars.copy_context()
+        if hasattr(self._ha, "_inside"):
+            context.run(self._ha._inside.set, False)
+        return context
+
+    async def _refresh_delayed(self, cid, uid, eid):
+        original = current_session.get()
+        if original is None:
+            return
+        async with self._user_locks.setdefault(uid, asyncio.Lock()):
+            latest = await self._db.load_ui_session(*original.key)
+            # Navigating away while the slider settles must never bring it back.
+            if latest.get("selected_entity") != eid or latest.get("actions") != original.data.get("actions"):
+                return
+            token = current_session.set(type(original)(*original.key, latest))
+            try:
+                await self._show_entity_control(cid, uid, eid)
+            finally:
+                current_session.reset(token)
+
+    async def close(self):
+        tasks = list(self._debounce_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _flush_brightness(
         self, key: tuple[int, int, str], cid: int, uid: int, uname: str, eid: str,
@@ -1186,13 +1432,11 @@ class Handlers:
         ok, err = await self._ha.call_service(
             "light", "turn_on", {"entity_id": eid, "brightness": target},
         )
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="light.brightness", entity_id=eid,
                      success=ok, error=err if not ok else None)
         if ok:
-            await self._show_entity_control(cid, uid, eid)
+            await self._refresh_delayed(cid, uid, eid)
 
     # -----------------------------------------------------------------------
     # clim: — climate temperature
@@ -1214,14 +1458,15 @@ class Handlers:
                 temp = float(state.get("attributes", {}).get("temperature", 20.0) or 20.0)
             except (TypeError, ValueError):
                 temp = 20.0
-        new_temp = temp + 0.5 if direction == "up" else temp - 0.5
+        attrs = (state or {}).get("attributes", {})
+        step = float(attrs.get("target_temp_step", 0.5) or 0.5)
+        new_temp = temp + step if direction == "up" else temp - step
+        new_temp = max(float(attrs.get("min_temp", 7)), min(float(attrs.get("max_temp", 35)), new_temp))
 
         await cb.answer("\U0001f321\ufe0f Температура...")
         ok, err = await self._ha.call_service(
-            "climate", "set_temperature", {"entity_id": eid, "temperature": new_temp},
+            eid.split(".")[0], "set_temperature", {"entity_id": eid, "temperature": new_temp},
         )
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="climate.set_temperature", entity_id=eid,
                      success=ok, error=err if not ok else None)
@@ -1241,7 +1486,7 @@ class Handlers:
         if not await self._check_rl(uid, "media_player.volume", cb):
             return
 
-        key = (cid, uid, eid)
+        key = (cid, uid, eid, current_session.get().thread_id if current_session.get() else 0)
         vol_step = 0.05
 
         # Use pending value if mid-debounce, otherwise fetch HA state
@@ -1267,6 +1512,7 @@ class Handlers:
             existing.cancel()
         self._debounce_tasks[key] = asyncio.create_task(
             self._flush_volume(key, cid, uid, uname, eid),
+            context=self._deferred_context(),
         )
 
     async def _flush_volume(
@@ -1286,13 +1532,11 @@ class Handlers:
             "media_player", "volume_set",
             {"entity_id": eid, "volume_level": round(target, 2)},
         )
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="media_player.volume_set", entity_id=eid,
                      success=ok, error=err if not ok else None)
         if ok:
-            await self._show_entity_control(cid, uid, eid)
+            await self._refresh_delayed(cid, uid, eid)
 
     # -----------------------------------------------------------------------
     # mmut: — media player mute toggle
@@ -1314,8 +1558,6 @@ class Handlers:
             "media_player", "volume_mute",
             {"entity_id": eid, "is_volume_muted": not is_muted},
         )
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="media_player.volume_mute", entity_id=eid,
                      success=ok, error=err if not ok else None)
@@ -1365,8 +1607,6 @@ class Handlers:
             "media_player", "select_source",
             {"entity_id": eid, "source": source},
         )
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="media_player.select_source", entity_id=eid,
                      success=ok, error=err if not ok else None)
@@ -1393,8 +1633,6 @@ class Handlers:
             "select", "select_option",
             {"entity_id": eid, "option": option},
         )
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="select.select_option", entity_id=eid,
                      success=ok, error=err if not ok else None)
@@ -1433,8 +1671,6 @@ class Handlers:
             "number", "set_value",
             {"entity_id": eid, "value": new_val},
         )
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="number.set_value", entity_id=eid,
                      success=ok, error=err if not ok else None)
@@ -1469,7 +1705,7 @@ class Handlers:
         await cb.answer(f"\U0001f4cc {msg}")
 
         # Refresh the current view
-        menu_state = await self._db.get_menu_state(cid)
+        menu_state = await self._menu_state(cid)
         current_menu = menu_state.get("current_menu", "") if menu_state else ""
         if current_menu.startswith("area:"):
             area_id = current_menu.split(":", 1)[1].split(":", 1)[0]
@@ -1478,7 +1714,7 @@ class Handlers:
             sa = self._cfg.show_all_enabled
             devices = self._reg.get_devices_for_area(area_id, domains, show_all=sa)
             area = self._reg.areas.get(area_id)
-            title = f"\U0001f3e0 <b>{area.name if area else area_id}</b>"
+            title = f"\U0001f3e0 <b>{self._sanitize(area.name if area else area_id)}</b>"
             is_pinned = await self._db.is_pinned(uid, "area", area_id)
             pin_label = "\U0001f4cc Убрать" if is_pinned else "\U0001f4cc Закрепить"
             pin_btn = InlineKeyboardButton(text=pin_label, callback_data=f"pin:area:{area_id}")
@@ -1519,7 +1755,7 @@ class Handlers:
         label = "Уведомления включены" if now_on else "Уведомления отключены"
         await cb.answer(f"\U0001f514 {label}")
         # Refresh the current view
-        menu_state = await self._db.get_menu_state(cid)
+        menu_state = await self._menu_state(cid)
         current_menu = menu_state.get("current_menu", "") if menu_state else ""
         if current_menu == "notif":
             await self._show_notif_list(cid, uid, 0)
@@ -1572,9 +1808,7 @@ class Handlers:
         except Exception as exc:
             logger.exception("Notification action %s.%s failed for %s", domain, service, eid)
             ok, err = False, str(exc)[:200]
-        if ok:
-            self._rl.record()
-            await cb.answer(f"\u2705 {service}", show_alert=False)
+            await cb.answer("Команда принята Home Assistant", show_alert=False)
         else:
             await cb.answer(f"\u274c {(err or '')[:180]}", show_alert=True)
 
@@ -1651,8 +1885,7 @@ class Handlers:
 
         ok, err = await self._ha.call_service(domain, service, svc_data)
         if ok:
-            self._rl.record()
-            await cb.answer(f"\u2705 {action.get('label', 'OK')}", show_alert=False)
+            await cb.answer("Команда принята Home Assistant", show_alert=False)
         else:
             await cb.answer(f"\u274c {(err or '')[:180]}", show_alert=True)
 
@@ -1918,8 +2151,6 @@ class Handlers:
         await cb.answer("\u2699\ufe0f Запускаю уборку...")
 
         ok, err = await self._vac.clean_segment(eid, seg_id)
-        if ok:
-            self._rl.record()
 
         segments = await self._vac.get_rooms(eid)
         seg_display = self._vac.get_segment_display_name(seg_id, segments)
@@ -1930,7 +2161,7 @@ class Handlers:
 
         if ok:
             t, k = build_confirmation(
-                f"\u2705 Уборка начата: {seg_display}", f"ent:{eid}",
+                f"Запрос уборки принят: {self._sanitize(seg_display)}. Статус обновляется Home Assistant.", f"ent:{eid}",
             )
         else:
             t, k = build_confirmation(
@@ -1956,15 +2187,13 @@ class Handlers:
 
         await cb.answer("\u2699\ufe0f Выполняю...")
         ok, err = await self._vac.execute_command(eid, command)
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action=f"vacuum.{command}", entity_id=eid,
                      success=ok, error=err if not ok else None)
 
         label = command.replace("_", " ").title()
         if ok:
-            t, k = build_confirmation(f"\u2705 Vacuum: {label}", f"ent:{eid}")
+            t, k = build_confirmation(f"Запрос принят Home Assistant: {label}", f"ent:{eid}")
         else:
             t, k = build_confirmation(f"\u274c {label}: {(err or '')[:200]}", f"ent:{eid}")
         await self._send_or_edit(cid, t, k, menu="vac_result", entity=eid)
@@ -1998,8 +2227,6 @@ class Handlers:
 
         await cb.answer("\u2699\ufe0f Запускаю сценарий...")
         ok, err = await self._vac.press_routine(btn_eid)
-        if ok:
-            self._rl.record()
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="button.press", entity_id=btn_eid,
                      success=ok, error=err if not ok else None)
@@ -2013,7 +2240,7 @@ class Handlers:
 
         back = f"vrtn:{parent_vac}" if parent_vac else "nav:main"
         if ok:
-            t, k = build_confirmation(f"\u2705 Сценарий запущен!", back)
+            t, k = build_confirmation("Запрос сценария принят Home Assistant", back)
         else:
             t, k = build_confirmation(f"\u274c Ошибка: {(err or '')[:200]}", back)
         await self._send_or_edit(cid, t, k, menu="rtn_result")
@@ -2254,8 +2481,9 @@ class Handlers:
     async def _enrich_entities(self, eids: list[str]) -> list[dict[str, Any]]:
         """Fetch state for entity IDs, return enriched dicts for UI."""
         result: list[dict[str, Any]] = []
+        states = {x["entity_id"]: x for x in await self._ha.list_states() if x.get("entity_id")}
         for eid in eids:
-            state = await self._ha.get_state(eid)
+            state = states.get(eid)
             if state and isinstance(state, dict):
                 result.append({
                     "entity_id": eid,
@@ -2367,7 +2595,7 @@ class Handlers:
             ok = False
         if ok:
             fname = self._reg.get_entity_display_name(eid)
-            await cb.answer(f"\u2705 {fname}")
+            await cb.answer("Команда принята Home Assistant")
             await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                          action="quick_scene", entity_id=eid, success=True)
         else:
@@ -2413,7 +2641,7 @@ class Handlers:
             logger.exception("Light color set failed for %s", eid)
             ok = False
         if ok:
-            await cb.answer(f"\u2705 {label}")
+            await cb.answer("Команда принята Home Assistant")
             await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                          action="light_color", entity_id=eid, success=True)
         else:
@@ -2444,8 +2672,9 @@ class Handlers:
             await cb.answer("\u274c Ошибка получения состояний", show_alert=True)
             return
 
+        from observations import independent_lights
         count = 0
-        for s in all_states:
+        for s in independent_lights(all_states):
             eid = s.get("entity_id", "")
             if not eid.startswith("light."):
                 continue
@@ -2462,7 +2691,7 @@ class Handlers:
                 except Exception:
                     logger.warning("Failed to set color on %s", eid)
 
-        await cb.answer(f"\u2705 {label} — {count} ламп")
+        await cb.answer(f"Команд принято: {count}")
         await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                      action="global_color", entity_id=label, success=True)
         t, k = build_global_color_result(label, count)
@@ -2493,7 +2722,9 @@ class Handlers:
 
         current_station = state.get("station_idx", 0)
         current_player = state.get("player_eid", "")
-        is_playing = state.get("playing", False)
+        player_state = next((x.get("state", "unknown") for x in all_states if x.get("entity_id") == current_player), "unknown")
+        is_playing = player_state == "playing"
+        state["playing"] = is_playing
 
         t, k = build_radio_menu(
             stations=stations,
@@ -2501,6 +2732,7 @@ class Handlers:
             current_idx=current_station,
             current_player=current_player,
             is_playing=is_playing,
+            playback_state=player_state,
         )
         await self._send_or_edit(cid, t, k, menu="radio")
 
@@ -2632,15 +2864,11 @@ class Handlers:
 
     async def _automation_toggle(self, cid: int, uid: int, uname: str, data: str, cb: CallbackQuery) -> None:
         """Toggle automation on/off."""
-        parts = data.split(":", 1)
-        eid = parts[1] if len(parts) > 1 else ""
-        if not eid:
-            await cb.answer("Некорректная автоматизация.", show_alert=True)
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[2] not in {"turn_on", "turn_off"}:
+            await cb.answer("Обновите карточку автоматизации.", show_alert=True)
             return
-        # Get current state to decide enable/disable
-        state = await self._ha.get_state(eid)
-        current = state.get("state", "off") if state else "off"
-        service = "turn_off" if current == "on" else "turn_on"
+        eid, service = parts[1:]
         try:
             ok, err = await self._ha.call_service("automation", service, {"entity_id": eid})
         except Exception as exc:
@@ -2648,7 +2876,7 @@ class Handlers:
             ok, err = False, str(exc)[:200]
         if ok:
             new_state = "выкл" if service == "turn_off" else "вкл"
-            await cb.answer(f"\U0001f916 {new_state}")
+            await cb.answer("Команда принята Home Assistant")
             await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                          action=f"automation.{service}", entity_id=eid, success=True)
         else:
@@ -2665,12 +2893,12 @@ class Handlers:
             await cb.answer("Некорректная автоматизация.", show_alert=True)
             return
         try:
-            ok, err = await self._ha.call_service("automation", "trigger", {"entity_id": eid})
+            ok, err = await self._ha.call_service("automation", "trigger", {"entity_id": eid, "skip_condition": False})
         except Exception as exc:
             logger.exception("Automation trigger failed for %s", eid)
             ok, err = False, str(exc)[:200]
         if ok:
-            await cb.answer("\u25b6 Запущено")
+            await cb.answer("Запрос запуска принят Home Assistant")
             await _audit(self._db, chat_id=cid, user_id=uid, username=uname,
                          action="automation.trigger", entity_id=eid, success=True)
         else:
@@ -2792,7 +3020,7 @@ class Handlers:
             return
         self._todo_add_pending[cid] = list_eid
         await cb.answer()
-        t = "\U0001f4cb Введите текст новой задачи в чат:"
+        t = "<b>Новая задача</b>\nОтветьте на это сообщение текстом задачи. /menu — отмена."
         k = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\u274c Отмена", callback_data=f"menu:todo")],
         ])
@@ -2813,6 +3041,7 @@ class Handlers:
     # /terminal command
     # -----------------------------------------------------------------------
 
+    @personal_entry
     async def cmd_terminal(self, message: Message) -> None:
         """Execute a shell command (local container only, restricted)."""
         uid, uname = self._extract_user(message)
@@ -2899,7 +3128,10 @@ class Handlers:
         return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     _ROUTES: dict[str, Any] = {
+        "ui": _ui_mode,
         "nav": _nav,
+        "domain": _domain,
+        "quick": _quick,
         "menu": _menu,
         "fl": _floor,
         "ar": _area,
@@ -2949,6 +3181,8 @@ class Handlers:
         "rout": _radio_output,
         "scp": _scenario_page,
         # Automations
+        "humi": _humidity,
+        "hmode": _humidity,
         "atog": _automation_toggle,
         "atrig": _automation_trigger,
         "autp": _automation_page,

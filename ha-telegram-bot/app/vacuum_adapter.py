@@ -48,11 +48,11 @@ class VacuumAdapter:
         try:
             platform = self._reg.vacuum_platforms.get(vacuum_eid, "")
             routines = self._reg.vacuum_routines.get(vacuum_eid, [])
-            segments = await self._db.get_vacuum_room_map(vacuum_eid)
+            segments = await self.get_rooms(vacuum_eid)
 
-            seg_count = len(segments) if segments else len(self._presets)
+            seg_count = len(segments)
             return VacuumCapabilities(
-                supports_segment_clean=seg_count > 0 or self._strategy == "script",
+                supports_segment_clean=seg_count > 0,
                 supports_routines=len(routines) > 0,
                 platform=platform,
                 segment_count=seg_count,
@@ -65,58 +65,46 @@ class VacuumAdapter:
     async def get_rooms(self, vacuum_eid: str) -> list[dict[str, Any]]:
         """Get available rooms/segments for vacuum."""
         try:
-            segments = await self._db.get_vacuum_room_map(vacuum_eid)
-            if segments:
-                return segments
-            # Fall back to config presets
-            return [
-                {"segment_id": r, "segment_name": r.replace("_", " ").title()}
-                for r in self._presets
-            ]
+            state = await self._ha.get_state(vacuum_eid)
+            if not state or state.get("state") in {"unknown", "unavailable"}:
+                return []
+            flags = int(state.get("attributes", {}).get("supported_features", 0))
+            entry = self._reg.entities.get(vacuum_eid)
+            mapping = entry.options.get("vacuum", {}).get("area_mapping", {}) if entry else {}
+            if flags & 16384 and isinstance(mapping, dict):
+                rooms = [{"segment_id": "area:" + aid, "segment_name": self._reg.areas[aid].name}
+                         for aid, segments in mapping.items()
+                         if aid in self._reg.areas and isinstance(segments, list) and segments]
+                if rooms:
+                    return rooms
+            if self._strategy == "script" and self._script_eid:
+                return [{"segment_id": r, "segment_name": r.replace("_", " ").title()} for r in self._presets]
+            # Compatibility for explicit numeric maps on older Roborock/Miio.
+            if flags & 256 and self._reg.vacuum_platforms.get(vacuum_eid) in {"roborock", "xiaomi_miio"}:
+                segments = await self._db.get_vacuum_room_map(vacuum_eid)
+                return [s for s in segments if str(s["segment_id"]).isdigit()]
+            return []
         except Exception:
             logger.exception("Failed to get vacuum rooms for %s", vacuum_eid)
             return []
 
-    async def clean_segment(
-        self, vacuum_eid: str, segment_id: str,
-    ) -> tuple[bool, str]:
-        """Start segment/room cleaning. Returns (success, error)."""
-        try:
-            # Real segment (numeric ID from integration)
-            try:
-                seg_int = int(segment_id)
-                ok, err = await self._ha.call_service(
-                    "vacuum", "send_command",
-                    {"entity_id": vacuum_eid, "command": "app_segment_clean", "params": [seg_int]},
-                )
-                return ok, err
-            except ValueError:
-                pass
-
-            # Named segment via configured strategy
-            if self._strategy == "script" and self._script_eid:
-                ok, err = await self._ha.call_service(
-                    "script", "turn_on",
-                    {
-                        "entity_id": self._script_eid,
-                        "variables": {"vacuum_entity": vacuum_eid, "room": segment_id},
-                    },
-                )
-                return ok, err
-
-            if self._strategy == "service_data":
-                ok, err = await self._ha.call_service(
-                    "vacuum", "send_command",
-                    {"entity_id": vacuum_eid, "command": "app_segment_clean",
-                     "params": {"rooms": [segment_id]}},
-                )
-                return ok, err
-
-            # Fallback: just start vacuum
-            return await self._ha.call_service("vacuum", "start", {"entity_id": vacuum_eid})
-        except Exception as exc:
-            logger.exception("Failed to clean segment %s for %s", segment_id, vacuum_eid)
-            return False, f"Ошибка уборки: {exc}"
+    async def clean_segment(self, vacuum_eid: str, segment_id: str) -> tuple[bool, str]:
+        """Resolve a current capability; unsupported room clean never starts a full clean."""
+        rooms = await self.get_rooms(vacuum_eid)
+        if not any(str(room["segment_id"]) == segment_id for room in rooms):
+            return False, "Комната больше недоступна. Проверьте привязку помещений в Home Assistant."
+        if segment_id.startswith("area:"):
+            return await self._ha.call_service("vacuum", "clean_area", {
+                "entity_id": vacuum_eid, "cleaning_area_id": [segment_id[5:]],
+            })
+        if self._strategy == "script" and self._script_eid:
+            return await self._ha.call_service("script", "turn_on", {
+                "entity_id": self._script_eid,
+                "variables": {"vacuum_entity": vacuum_eid, "room": segment_id},
+            })
+        return await self._ha.call_service("vacuum", "send_command", {
+            "entity_id": vacuum_eid, "command": "app_segment_clean", "params": [int(segment_id)],
+        })
 
     async def execute_command(
         self, vacuum_eid: str, command: str,
@@ -133,6 +121,8 @@ class VacuumAdapter:
     async def press_routine(self, button_eid: str) -> tuple[bool, str]:
         """Press a routine button entity."""
         try:
+            if not any(button_eid in buttons for buttons in self._reg.vacuum_routines.values()):
+                return False, "Сценарий больше недоступен. Обновите устройства."
             return await self._ha.call_service("button", "press", {"entity_id": button_eid})
         except Exception as exc:
             logger.exception("Failed to press routine %s", button_eid)

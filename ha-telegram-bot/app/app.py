@@ -36,6 +36,7 @@ from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.filters import Command
 
 from api import HAClient
+from actions import ActionService
 from diagnostics import Diagnostics, ErrorCapture
 from handlers import GlobalRateLimiter, Handlers
 from notifications import NotificationManager
@@ -43,6 +44,7 @@ from registry import HARegistry
 from scheduler import Scheduler
 from storage import Database
 from vacuum_adapter import VacuumAdapter
+from widget_ui import WidgetUpdates
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -113,6 +115,9 @@ class Config:
     radio_stations: tuple[dict[str, str], ...]
     device_overrides: dict[str, dict[str, Any]]
     terminal_enabled: bool
+    admin_user_ids: tuple[int, ...] = ()
+    widgets_enabled: bool = False
+    widgets_retry_seconds: int = 3600
 
 
 def _coerce_user_ids(raw: Any) -> list[int]:
@@ -256,6 +261,7 @@ def _load_and_validate_config() -> tuple[Config, str]:
     default_domains = [
         "light", "switch", "vacuum", "media_player", "climate", "fan", "cover",
         "scene", "script", "select", "number", "lock", "water_heater", "sensor",
+        "humidifier", "binary_sensor", "button", "input_boolean", "todo",
     ]
     domains_al = raw.get("menu_domains_allowlist", default_domains)
     if not isinstance(domains_al, list):
@@ -350,6 +356,9 @@ def _load_and_validate_config() -> tuple[Config, str]:
         radio_stations=tuple(radio_stations),
         device_overrides=device_overrides,
         terminal_enabled=terminal_enabled,
+        admin_user_ids=tuple(_coerce_user_ids(raw.get("admin_user_ids", []))),
+        widgets_enabled=raw.get("widgets_enabled") is True,
+        widgets_retry_seconds=max(60, min(86400, int(raw.get("widgets_retry_seconds", 3600)))),
     )
     return config, supervisor_token
 
@@ -373,20 +382,21 @@ class TelegramBot:
         self._ha = HAClient(supervisor_token)
         self._db = Database(DB_PATH)
         self._registry = HARegistry(supervisor_token, self._db)
-        self._notif = NotificationManager(supervisor_token, self._db, self._bot)
+        self._notif = NotificationManager(supervisor_token, self._db, self._bot, config)
         self._global_rl = GlobalRateLimiter(
             config.global_rate_limit_actions,
             config.global_rate_limit_window,
         )
+        self._actions = ActionService(self._ha, self._db, config, self._global_rl)
         self._vacuum = VacuumAdapter(
-            ha=self._ha,
+            ha=self._actions,
             db=self._db,
             registry=self._registry,
             strategy=config.vacuum_room_strategy,
             script_entity_id=config.vacuum_room_script_entity_id,
             presets=config.vacuum_room_presets,
         )
-        self._scheduler = Scheduler(self._ha, self._db)
+        self._scheduler = Scheduler(self._actions, self._db, config)
         self._diagnostics: Diagnostics | None = None
         self._error_capture: ErrorCapture | None = None
         self._handlers: Handlers | None = None
@@ -539,6 +549,8 @@ class TelegramBot:
 
     async def run(self) -> None:
         await self._db.open()
+        for user_id in self._config.admin_user_ids:
+            await self._db.set_user_role(user_id, "admin")
         await self._ha.open()
 
         # Readiness gating — wait for HA with exponential backoff
@@ -569,7 +581,7 @@ class TelegramBot:
         # Handlers
         self._handlers = Handlers(
             bot=self._bot,
-            ha=self._ha,
+            ha=self._actions,
             db=self._db,
             config=self._config,
             global_rl=self._global_rl,
@@ -580,9 +592,12 @@ class TelegramBot:
         )
         self._handlers.ha_version = ha_version
 
+        self._dp.update.outer_middleware(WidgetUpdates(self._handlers.widgets))
+
         # Register commands
         self._dp.message.register(self._handlers.cmd_start, Command("start"))
         self._dp.message.register(self._handlers.cmd_start, Command("menu"))
+        self._dp.message.register(self._handlers.cmd_widgets, Command("widgets"))
         self._dp.message.register(self._handlers.cmd_status, Command("status"))
         self._dp.message.register(self._handlers.cmd_ping, Command("ping"))
         self._dp.message.register(self._handlers.cmd_search, Command("search"))
@@ -625,11 +640,11 @@ class TelegramBot:
         logger.info("Authorization mode: %s, %s", chat_mode, user_mode)
 
         mode_label = "degraded" if not self._ha_ready else "full"
-        logger.info("Bot polling started (v2.3.5, mode=%s)", mode_label)
+        logger.info("Bot polling started (v2.4.0, mode=%s)", mode_label)
 
         await self._dp.start_polling(
             self._bot,
-            allowed_updates=["message", "callback_query"],
+            allowed_updates=["message", "callback_query", "widget_query", "shared_widget_query"],
         )
 
     async def shutdown(self) -> None:
@@ -642,6 +657,9 @@ class TelegramBot:
                 await self._recovery_task
             except asyncio.CancelledError:
                 pass
+
+        if self._handlers:
+            await self._handlers.close()
 
         # Remove error capture handler
         if self._error_capture is not None:

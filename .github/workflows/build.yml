@@ -1,19 +1,38 @@
-name: Build and Push Add-on
+name: Test and Build Add-on
 
 on:
+  pull_request:
+    branches: [main]
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: ha-telegram-bot/app/requirements.txt
+      - run: pip install -r ha-telegram-bot/requirements-dev.txt
+      - run: pytest -q
+        working-directory: ha-telegram-bot
+      - run: python ha-telegram-bot/tools/check_widgets.py
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
@@ -28,42 +47,39 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Get add-on version
-        id: version
+      - name: Read image metadata
+        id: meta
         run: |
-          VERSION=$(grep '^version:' ha-telegram-bot/config.yaml | awk '{print $2}' | tr -d '"')
+          VERSION=$(awk '/^version:/ {gsub(/"/, "", $2); print $2}' ha-telegram-bot/config.yaml)
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Lowercase owner
-        id: owner
-        run: |
           echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR for authorized release events
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
+      - name: Build (PRs never publish)
         uses: docker/build-push-action@v6
         with:
           context: ha-telegram-bot
           file: ha-telegram-bot/Dockerfile
           platforms: ${{ matrix.platform }}
-          push: true
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name == 'pull_request' }}
           build-args: |
             BUILD_FROM=${{ matrix.build_from }}
-            BUILD_VERSION=${{ steps.version.outputs.version }}
+            BUILD_VERSION=${{ steps.meta.outputs.version }}
             BUILD_ARCH=${{ matrix.arch }}
           tags: |
-            ghcr.io/${{ steps.owner.outputs.owner }}/ha-bot-ha-telegram-bot-${{ matrix.arch }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ steps.owner.outputs.owner }}/ha-bot-ha-telegram-bot-${{ matrix.arch }}:latest
+            ghcr.io/${{ steps.meta.outputs.owner }}/ha-bot-ha-telegram-bot-${{ matrix.arch }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/ha-bot-ha-telegram-bot-${{ matrix.arch }}:latest
+      - name: Offline container import and Widget size smoke test
+        if: github.event_name == 'pull_request'
+        run: >-
+          docker run --rm --network none --entrypoint python3
+          ghcr.io/${{ steps.meta.outputs.owner }}/ha-bot-ha-telegram-bot-${{ matrix.arch }}:${{ steps.meta.outputs.version }}
+          -c 'import app, widget_ui, sqlite3; from widget_transport import validate_html; print(sqlite3.sqlite_version, validate_html(widget_ui.HTML))'

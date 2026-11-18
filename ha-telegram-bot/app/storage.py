@@ -48,6 +48,19 @@ class Database:
 
     async def _create_tables(self) -> None:
         assert self._db is not None
+        await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS ui_sessions (
+                chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL DEFAULT 0, payload TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL, PRIMARY KEY(chat_id,user_id,thread_id)
+            );
+            CREATE TABLE IF NOT EXISTS ui_notices (
+                user_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                actions TEXT NOT NULL, created_at REAL NOT NULL,
+                PRIMARY KEY(user_id,message_id)
+            );
+            CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """)
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS cooldowns (
                    user_id   INTEGER NOT NULL,
@@ -192,6 +205,65 @@ class Database:
                )"""
         )
 
+    async def load_ui_session(self, chat_id: int, user_id: int, thread_id: int = 0) -> dict:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT payload FROM ui_sessions WHERE chat_id=? AND user_id=? AND thread_id=?",
+            (chat_id, user_id, thread_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return json.loads(row[0]) if row else {}
+
+    async def save_ui_session(self, chat_id: int, user_id: int, thread_id: int, payload: dict) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO ui_sessions VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id,user_id,thread_id) DO UPDATE SET "
+            "payload=excluded.payload, updated_at=excluded.updated_at",
+            (chat_id, user_id, thread_id, json.dumps(payload, ensure_ascii=False), time.time()),
+        )
+        await self._db.commit()
+
+    async def find_widget_session(self, chat_id: int, user_id: int, message_id: int) -> tuple[int, dict] | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT thread_id, payload FROM ui_sessions WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        for thread, raw in rows:
+            data = json.loads(raw)
+            if data.get("widget_message_id") == message_id:
+                return thread, data
+        return None
+
+    async def save_notice(self, user_id: int, message_id: int, actions: list[str]) -> None:
+        assert self._db is not None
+        await self._db.execute("INSERT OR REPLACE INTO ui_notices VALUES (?, ?, ?, ?)",
+                               (user_id, message_id, json.dumps(actions), time.time()))
+        await self._db.execute("DELETE FROM ui_notices WHERE created_at < ?", (time.time() - 86400 * 7,))
+        await self._db.commit()
+
+    async def notice_allows(self, user_id: int, message_id: int, action: str) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT actions FROM ui_notices WHERE user_id=? AND message_id=? AND created_at>?",
+            (user_id, message_id, time.time() - 86400 * 7),
+        ) as cur:
+            row = await cur.fetchone()
+        return bool(row and action in json.loads(row[0]))
+
+    async def get_runtime_value(self, key: str) -> str | None:
+        assert self._db is not None
+        async with self._db.execute("SELECT value FROM runtime_state WHERE key=?", (key,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def set_runtime_value(self, key: str, value: str) -> None:
+        assert self._db is not None
+        await self._db.execute("INSERT OR REPLACE INTO runtime_state VALUES (?, ?)", (key, value))
+        await self._db.commit()
+
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
@@ -205,21 +277,20 @@ class Database:
         assert self._db is not None
         now = time.time()
         async with self._db.execute(
-            "SELECT last_used FROM cooldowns WHERE user_id = ? AND action = ?",
-            (user_id, action),
+            "INSERT INTO cooldowns(user_id,action,last_used) VALUES (?,?,?) "
+            "ON CONFLICT(user_id,action) DO UPDATE SET last_used=excluded.last_used "
+            "WHERE cooldowns.last_used <= ?",
+            (user_id, action, now, now - cooldown_seconds),
+        ) as cur:
+            accepted = cur.rowcount == 1
+        await self._db.commit()
+        if accepted:
+            return True, 0.0
+        async with self._db.execute(
+            "SELECT last_used FROM cooldowns WHERE user_id=? AND action=?", (user_id, action),
         ) as cur:
             row = await cur.fetchone()
-        if row is not None:
-            elapsed = now - row[0]
-            if elapsed < cooldown_seconds:
-                return False, cooldown_seconds - elapsed
-        await self._db.execute(
-            "INSERT INTO cooldowns (user_id, action, last_used) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id, action) DO UPDATE SET last_used = excluded.last_used",
-            (user_id, action, now),
-        )
-        await self._db.commit()
-        return True, 0.0
+        return False, max(0.0, cooldown_seconds - (now - row[0]))
 
     # --- audit ---
 
@@ -990,43 +1061,67 @@ class Database:
         }
 
     async def import_user_settings(self, user_id: int, data: dict[str, Any]) -> int:
-        """Import user settings from backup. Returns count of imported items."""
+        """Merge a bounded backup; never import identity/roles or activate schedules."""
+        from actions import ENTITY_ID, validate_service
+        from scheduler import validate_cron, next_cron_time
         assert self._db is not None
         count = 0
-
-        # Favorites
-        for eid in data.get("favorites", []):
-            if isinstance(eid, str) and "." in eid:
-                is_fav = await self.is_favorite(user_id, eid)
-                if not is_fav:
-                    await self._db.execute(
-                        "INSERT OR IGNORE INTO favorites (user_id, entity_id) VALUES (?, ?)",
-                        (user_id, eid),
-                    )
-                    count += 1
-
-        # Notifications
-        for notif in data.get("notifications", []):
-            eid = notif.get("entity_id", "")
-            if eid:
-                existing = await self.get_notification(user_id, eid)
-                if existing is None:
-                    mode = notif.get("mode", "state_only")
-                    await self._db.execute(
-                        "INSERT INTO notifications (user_id, entity_id, enabled, mode, throttle_seconds, last_sent_ts) "
-                        "VALUES (?, ?, 1, ?, 60, 0)",
-                        (user_id, eid, mode),
-                    )
-                    count += 1
-
-        # Pinned items
-        for pin in data.get("pinned_items", []):
-            itype = pin.get("item_type", "")
-            tid = pin.get("target_id", "")
-            if itype and tid:
-                added = await self.add_pinned_item(user_id, itype, tid, pin.get("label", ""))
-                if added:
-                    count += 1
-
+        role = await self.get_user_role(user_id)
+        if role not in {"admin", "user"}:
+            return 0
+        def items(key):
+            value = data.get(key, [])
+            return value[:1000] if isinstance(value, list) else []
+        for eid in items("favorites"):
+            if isinstance(eid, str) and ENTITY_ID.fullmatch(eid) and not await self.is_favorite(user_id, eid):
+                await self._db.execute("INSERT OR IGNORE INTO favorites (user_id, entity_id) VALUES (?, ?)", (user_id, eid))
+                count += 1
+        for notif in items("notifications"):
+            if not isinstance(notif, dict):
+                continue
+            eid = notif.get("entity_id")
+            if not isinstance(eid, str) or not ENTITY_ID.fullmatch(eid) or await self.get_notification(user_id, eid):
+                continue
+            mode = notif.get("mode", "state_only")
+            if mode not in {"state_only", "state_and_key_attrs"}:
+                continue
+            throttle = notif.get("throttle_seconds", 60)
+            throttle = max(10, min(86400, throttle)) if type(throttle) is int else 60
+            await self._db.execute(
+                "INSERT INTO notifications (user_id, entity_id, enabled, mode, throttle_seconds, last_sent_ts) VALUES (?, ?, ?, ?, ?, 0)",
+                (user_id, eid, int(bool(notif.get("enabled", True))), mode, throttle))
+            count += 1
+        for pin in items("pinned_items"):
+            if isinstance(pin, dict) and pin.get("item_type") in {"area", "routine"} and isinstance(pin.get("target_id"), str):
+                count += bool(await self.add_pinned_item(user_id, pin["item_type"], pin["target_id"], str(pin.get("label", ""))[:200]))
+        existing_actions = await self.get_favorite_actions(user_id)
+        existing_schedules = await self.get_schedules(user_id)
+        for key in ("favorite_actions", "schedules"):
+            for item in items(key):
+                if not isinstance(item, dict) or item.get("action_type") not in {"service_call", "ha_automation"}:
+                    continue
+                payload = item.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if item["action_type"] == "ha_automation":
+                    payload = {"domain": "automation", "service": "trigger", "data": {"entity_id": payload.get("entity_id"), "skip_condition": False}}
+                if validate_service(payload.get("domain"), payload.get("service"), payload.get("data"), role=role):
+                    continue
+                if key == "favorite_actions":
+                    label = str(item.get("label", "Действие"))[:200]
+                    if any(a["payload"] == payload and a["label"] == label for a in existing_actions):
+                        continue
+                    await self.add_favorite_action(user_id, "service_call", payload, label)
+                    existing_actions.append({"payload": payload, "label": label})
+                else:
+                    cron, name = item.get("cron_expr"), str(item.get("name", "Расписание"))[:200]
+                    if not isinstance(cron, str) or validate_cron(cron):
+                        continue
+                    if any(a["payload"] == payload and a["name"] == name and a["cron_expr"] == cron for a in existing_schedules):
+                        continue
+                    schedule_id = await self.add_schedule(user_id, name, "service_call", payload, cron, next_cron_time(cron))
+                    await self.toggle_schedule(schedule_id, user_id)  # Imported schedules are always disabled.
+                    existing_schedules.append({"payload": payload, "name": name, "cron_expr": cron})
+                count += 1
         await self._db.commit()
         return count
