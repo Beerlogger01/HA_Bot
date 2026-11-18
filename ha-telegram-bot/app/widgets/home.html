@@ -1,0 +1,21 @@
+<!doctype html><html><head><style>
+*{box-sizing:border-box}body{margin:0;padding:16px 16px 24px;font:14px system-ui;color:var(--tg-theme-text-color);color-scheme:light dark}.eyebrow{font-size:11px;color:var(--tg-theme-hint-color);letter-spacing:1px}h2{font-size:22px;margin:7px 0 12px;font-weight:650}#body{white-space:pre-wrap;line-height:1.45;max-height:160px;overflow:hidden;margin-bottom:14px}#actions{display:grid;grid-template-columns:1fr 1fr;gap:8px}button{font:inherit;text-align:left;border:0;border-radius:12px;padding:12px;background:var(--tg-theme-secondary-bg-color);color:var(--tg-theme-text-color);min-height:46px;overflow-wrap:anywhere}button:active{background:var(--tg-theme-button-color);color:var(--tg-theme-button-text-color)}button:disabled{color:var(--tg-theme-hint-color)}#status{font-size:12px;color:var(--tg-theme-hint-color);margin:12px 0 0;min-height:18px;overflow-wrap:anywhere}footer{margin-top:8px;font-size:11px;color:var(--tg-theme-hint-color);padding-right:env(safe-area-inset-right)}@media(max-width:260px){body{padding:10px 10px 22px}button{padding:9px;font-size:12px}h2{font-size:19px}}
+</style></head><body><div class="eyebrow">HOME ASSISTANT</div><h2 id="title">Мой дом</h2><div id="body">Откройте /menu для управления домом</div><div id="actions"></div><div id="status"></div><footer>Ваш экран · /menu — обычное меню</footer><script>
+var W=window.TelegramWidget,busy=false,revision=-1;
+function draw(){
+ var d={};try{d=JSON.parse(W.chatData||W.publicData||'{}')}catch(e){}
+ if((d.r||0)<revision)return;revision=d.r||0;
+ document.getElementById('title').textContent=d.t||'Мой дом';
+ document.getElementById('body').textContent=d.b||'Откройте /menu для управления домом';
+ document.getElementById('status').textContent=d.n||'';
+ var root=document.getElementById('actions');root.innerHTML='';
+ var owner=W.viewer&&String(W.viewer.id)===String(d.u);
+ (d.a||[]).forEach(function(a){var button=document.createElement('button');button.textContent=a[0];button.disabled=busy||!owner;button.addEventListener('click',function(){send(a[1])});root.appendChild(button)});
+ if(!owner&&d.u)document.getElementById('status').textContent='Личный экран другого пользователя. Откройте /menu';
+}
+function send(data){
+ if(busy)return;busy=true;draw();document.getElementById('status').textContent='Отправляю…';
+ W.request(data).then(function(answer){var r={};try{r=JSON.parse(answer.result||'{}')}catch(e){}document.getElementById('status').textContent=r.message||'Принято';},function(error){var labels={RATE_LIMITED:'Слишком часто. Подождите 5 секунд.',BUSY:'Дождитесь ответа.',TIMEOUT:'Ответ задержался. Обновите экран.',NOT_ALLOWED:'Откройте обычное меню: /menu'};document.getElementById('status').textContent=labels[error.code]||'Нет связи. Откройте /menu';}).finally(function(){busy=false;var note=document.getElementById('status').textContent;draw();document.getElementById('status').textContent=note});
+}
+if(W){W.onEvent('chatDataChanged',draw);W.onEvent('publicDataChanged',draw);W.onEvent('themeChanged',draw);W.watchPublicData();draw();W.ready()}
+</script></body></html>

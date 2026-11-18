@@ -16,6 +16,8 @@ from typing import Any
 
 from api import HAClient
 from storage import Database
+from sessions import UISession, current_session
+from actions import validate_service
 
 logger = logging.getLogger("ha_bot.scheduler")
 
@@ -35,6 +37,8 @@ def parse_cron_field(field: str, min_val: int, max_val: int) -> list[int] | None
             try:
                 step = int(step_str)
             except ValueError:
+                return None
+            if step <= 0:
                 return None
             if base == "*":
                 values.extend(range(min_val, max_val + 1, step))
@@ -121,7 +125,8 @@ def validate_cron(cron_expr: str) -> str | None:
 class Scheduler:
     """Background task that checks and executes due schedules."""
 
-    def __init__(self, ha: HAClient, db: Database) -> None:
+    def __init__(self, ha: HAClient, db: Database, config=None) -> None:
+        self._cfg = config
         self._ha = ha
         self._db = db
         self._task: asyncio.Task[None] | None = None
@@ -156,7 +161,13 @@ class Scheduler:
         now = time.time()
         due = await self._db.get_due_schedules(now)
         for sched in due:
-            result = await self._execute(sched)
+            uid = sched["user_id"]
+            cid = getattr(self._cfg, "allowed_chat_id", 0) or uid
+            token = current_session.set(UISession(cid, uid, 0, {}))
+            try:
+                result = await self._execute(sched)
+            finally:
+                current_session.reset(token)
             # Calculate next run
             nr = next_cron_time(sched["cron_expr"], after=now)
             if nr == 0.0:
@@ -180,6 +191,10 @@ class Scheduler:
             data = payload.get("data", {})
             if not domain or not service:
                 return "ERROR: missing domain/service"
+            role = await self._db.get_user_role(sched["user_id"])
+            error = validate_service(domain, service, data, role=role)
+            if error:
+                return f"DENIED: {error}"
             ok, err = await self._ha.call_service(domain, service, data)
             if ok:
                 return "OK"
@@ -190,7 +205,7 @@ class Scheduler:
             if not eid:
                 return "ERROR: missing entity_id"
             ok, err = await self._ha.call_service(
-                "automation", "trigger", {"entity_id": eid},
+                "automation", "trigger", {"entity_id": eid, "skip_condition": False},
             )
             return "OK" if ok else f"ERROR: {err[:200]}"
 

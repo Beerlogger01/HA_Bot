@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import aiohttp
@@ -32,6 +33,9 @@ class HAClient:
             "Content-Type": "application/json",
         }
         self._session: aiohttp.ClientSession | None = None
+        self._states: list[dict[str, Any]] = []
+        self._states_at = 0.0
+        self._states_lock = asyncio.Lock()
 
     async def open(self) -> None:
         self._session = aiohttp.ClientSession(timeout=HA_TIMEOUT)
@@ -54,7 +58,8 @@ class HAClient:
         url = f"{HA_BASE_URL}/{path}"
         last_error = ""
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        attempts = MAX_RETRIES if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
             try:
                 async with self._session.request(
                     method, url, json=json_data, headers=self._headers
@@ -94,7 +99,7 @@ class HAClient:
                     attempt, MAX_RETRIES, method, path, exc,
                 )
 
-            if attempt < MAX_RETRIES:
+            if attempt < attempts:
                 # Longer backoff for 502/503 (HA booting) vs other transient errors
                 if "HTTP 502" in last_error or "HTTP 503" in last_error:
                     delay = RETRY_BACKOFF_BASE * 2 * (2 ** (attempt - 1))
@@ -104,7 +109,7 @@ class HAClient:
 
         logger.error(
             "HA API failed after %d attempts: %s %s -> %s",
-            MAX_RETRIES, method, path, last_error,
+            attempts, method, path, last_error,
         )
         return False, last_error
 
@@ -120,11 +125,15 @@ class HAClient:
 
     async def call_service(
         self, domain: str, service: str, data: dict[str, Any]
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str | dict[str, Any]]:
         """Call an HA service.  Returns (success, error_message_or_empty)."""
+        self._states_at = 0.0  # Invalidate even on ambiguous write failure.
+        response_query = "?return_response" if (domain, service) == ("todo", "get_items") else ""
         ok, result = await self._request(
-            "POST", f"services/{domain}/{service}", json_data=data
+            "POST", f"services/{domain}/{service}{response_query}", json_data=data
         )
+        if ok and response_query:
+            return True, result.get("service_response", {})
         if ok:
             logger.info(
                 "Service called: %s.%s entity=%s",
@@ -140,10 +149,13 @@ class HAClient:
 
     async def list_states(self) -> list[dict[str, Any]]:
         """Return all entity states or empty list on failure."""
-        ok, result = await self._request("GET", "states")
-        if ok and isinstance(result, list):
-            return result
-        return []
+        async with self._states_lock:
+            if time.monotonic() - self._states_at < 2:
+                return self._states
+            ok, result = await self._request("GET", "states")
+            self._states = result if ok and isinstance(result, list) else []
+            self._states_at = time.monotonic()
+            return self._states
 
     async def list_services(self) -> list[dict[str, Any]]:
         """Return all available services or empty list on failure."""

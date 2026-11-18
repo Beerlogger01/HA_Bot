@@ -1,7 +1,7 @@
 ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.20
 FROM ${BUILD_FROM}
 
-ARG BUILD_VERSION=2.0.0
+ARG BUILD_VERSION=2.4.0
 ARG BUILD_ARCH=amd64
 
 LABEL \

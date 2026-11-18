@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.4.0
+
+- Personal persistent UI sessions by chat, user and forum topic; message-bound opaque buttons reject stale/foreign screens. Legacy SQLite data remains intact.
+- Compact home overview, direct favorite actions, capability-aware cards, climate/humidity observation ages, device companion entities and explicit automation enable/run flows.
+- Common authorized, audited HA action layer for inline, Widgets and schedules; serialized writes, atomic cooldowns, no automatic service POST retry, safe confirmations and admin bootstrap.
+- Native Bot API 10.4 Widget transport and Profile 1 UI using aiogram 3.32.0; Widgets disabled by default, persisted restriction cooldown, automatic inline fallback and offline preview.
+- Verified HA vacuum area mapping and preserved numeric legacy segments; unknown rooms never fall back to full cleaning. Maintenance buttons are not inferred to be routines.
+- Distinguish service acceptance from physical state, avoid false vacuum completion announcements and duplicate explicit light-group commands.
+- Complete JSON settings export, validated merge import, preserved roles and disabled restored schedules.
+- Updated aiohttp 3.14.5 / aiosqlite 0.22.1, adapted WebSocket timeouts, expanded integration tests and PR-only multi-architecture build/import checks without publication.
+- Added architecture, upgrade, Widget/fallback and testing documentation. Real Telegram Widget sending remains unverified while ordinary bots receive INPUT_MEDIA_WIDGET_NOT_ALLOWED.
+
+
 ## 2.3.7
 
 - **Radio fix** — fixed TypeError crash when opening Radio menu (parameter name mismatch `current_station_idx` vs `current_idx`)

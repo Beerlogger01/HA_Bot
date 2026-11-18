@@ -20,6 +20,7 @@ from typing import Any
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from state_mapping import map_state
+from observations import observation_age, independent_lights
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -54,6 +55,8 @@ DOMAIN_LABELS: dict[str, str] = {
     "scene": "Сцены",
     "script": "Скрипты",
     "climate": "Климат",
+    "humidifier": "Увлажнители",
+    "automation": "Автоматизации",
     "fan": "Вентиляторы",
     "cover": "Шторы/Ворота",
     "sensor": "Датчики",
@@ -116,7 +119,7 @@ def _trunc(text: str, max_len: int = 28) -> str:
 
 def _home_btn() -> InlineKeyboardButton:
     """Home button to return to main menu."""
-    return InlineKeyboardButton(text="\U0001f3e0 Меню", callback_data="nav:main")
+    return InlineKeyboardButton(text="Дом", callback_data="nav:main")
 
 
 # ---------------------------------------------------------------------------
@@ -124,37 +127,84 @@ def _home_btn() -> InlineKeyboardButton:
 # ---------------------------------------------------------------------------
 
 
-def build_main_menu() -> tuple[str, InlineKeyboardMarkup]:
-    text = (
-        "\U0001f3e0 <b>Home Assistant Bot</b>\n\n"
-        "Выберите действие:"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="\U0001f3db Устройства", callback_data="menu:devices"),
-            InlineKeyboardButton(text="\U0001f3ac Сценарии", callback_data="menu:scenarios"),
-        ],
-        [
-            InlineKeyboardButton(text="\U0001f7e2 Активные", callback_data="menu:active"),
-            InlineKeyboardButton(text="\U0001f4fb Радио \U0001f1f7\U0001f1fa", callback_data="menu:radio"),
-        ],
-        [
-            InlineKeyboardButton(text="\U0001f3a8 Цвет света", callback_data="menu:gcolor"),
-            InlineKeyboardButton(text="\u2b50 Избранное", callback_data="menu:favorites"),
-        ],
-        [
-            InlineKeyboardButton(text="\U0001f514 Уведомления", callback_data="menu:notif"),
-            InlineKeyboardButton(text="\U0001f916 Автоматизации", callback_data="menu:automations"),
-        ],
-        [
-            InlineKeyboardButton(text="\U0001f4cb Списки дел", callback_data="menu:todo"),
-            InlineKeyboardButton(text="\u2139\ufe0f Статус", callback_data="menu:status"),
-        ],
-        [
-            InlineKeyboardButton(text="\U0001f504 SYNC", callback_data="menu:refresh"),
-        ],
+def build_main_menu(
+    states: list[dict[str, Any]] | None = None,
+    favorites: list[str] | None = None,
+    *, online: bool = True,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Home is a live overview with direct access to the things used every day."""
+    states = states or []
+    by_id = {x["entity_id"]: x for x in states if x.get("entity_id")}
+    lights = independent_lights(states)
+    active = sum(map_state(x["entity_id"], x.get("state", "unknown"), x.get("attributes", {})).is_active
+                 for x in states if x.get("entity_id"))
+    unavailable = sum(x.get("state") == "unavailable" for x in states)
+    lines = ["<b>Мой дом</b>", ""]
+    if not online:
+        lines.append("⚠ Home Assistant недоступен. Попробуйте обновить позже.")
+    elif states:
+        lines.append(f"Активно: <b>{active}</b>  ·  Сущностей: {len(states)}")
+        if lights:
+            on = sum(x.get("state") == "on" for x in lights)
+            lines.append(f"Свет: <b>{on}</b> из {len(lights)} включено")
+        measurements = {"temperature": [], "humidity": []}
+        for x in states:
+            attrs = x.get("attributes", {})
+            kind = attrs.get("device_class")
+            if kind in measurements and x.get("state") not in ("unknown", "unavailable"):
+                measurements[kind].append(
+                    f"{_sanitize(str(attrs.get('friendly_name', x['entity_id']))[:26])}: "
+                    f"<b>{_sanitize(str(x.get('state', '')))} {_sanitize(str(attrs.get('unit_of_measurement', '')))}</b>"
+                    f"\n<i>{observation_age(x)}</i>")
+        lines.extend(measurements["temperature"][:1] + measurements["humidity"][:1])
+        if unavailable:
+            lines.append(f"⚠ Недоступно: {unavailable}")
+    else:
+        lines.append("Нет отображаемых устройств. Проверьте фильтры и синхронизацию с Home Assistant.")
+    rows = []
+    # A direct explicit on/off action avoids surprising toggles on stale screens.
+    for eid in (favorites or [])[:3]:
+        item = by_id.get(eid)
+        if not item:
+            continue
+        name = item.get("attributes", {}).get("friendly_name", eid)
+        row = [InlineKeyboardButton(text=_trunc(str(name), 24), callback_data=f"ent:{eid}")]
+        if eid.split(".")[0] in ("light", "switch", "input_boolean", "fan") and item.get("state") in ("on", "off"):
+            on = item["state"] == "on"
+            row.append(InlineKeyboardButton(text="Выключить" if on else "Включить",
+                                           callback_data=f"quick:{eid}:{'turn_off' if on else 'turn_on'}"))
+        rows.append(row)
+    shortcuts = []
+    if lights:
+        shortcuts.append(InlineKeyboardButton(text="Свет", callback_data="domain:light:0"))
+    if any(x.startswith(("climate.", "humidifier.", "water_heater.")) for x in by_id):
+        shortcuts.append(InlineKeyboardButton(text="Климат", callback_data="domain:climate:0"))
+    if shortcuts:
+        rows.append(shortcuts)
+    rows.extend([
+        [InlineKeyboardButton(text="Комнаты", callback_data="menu:devices"),
+         InlineKeyboardButton(text="Избранное", callback_data="menu:favorites")],
+        [InlineKeyboardButton(text="Сценарии", callback_data="menu:scenarios"),
+         InlineKeyboardButton(text="Активные", callback_data="menu:active")],
+        [InlineKeyboardButton(text="Поиск", callback_data="menu:search"),
+         InlineKeyboardButton(text="Ещё", callback_data="menu:more")],
+        [InlineKeyboardButton(text="Обновить", callback_data="nav:main")],
     ])
-    return text, kb
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_more_menu(admin: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    items = [("Радио", "radio"), ("Списки дел", "todo"),
+             ("Уведомления", "notif"), ("Расписания", "schedule"),
+             ("Автоматизации", "automations"), ("Снимки", "snapshots"),
+             ("Действия", "fav_actions"), ("Состояние дома", "status"),
+             ("Настройки и помощь", "help")]
+    if admin:
+        items += [("Весь свет", "gcolor"), ("Диагностика", "diag"), ("Синхронизация", "refresh")]
+    buttons = [InlineKeyboardButton(text=label, callback_data=f"menu:{target}") for label, target in items]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([_home_btn()])
+    return "<b>Возможности дома</b>\nСервисы, история и настройки", InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # Active states that indicate the entity is "on" / working
@@ -171,7 +221,7 @@ def build_active_now_menu(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Show entities that are currently in an active state."""
     if not entities:
-        text = "\U0001f7e2 <b>Активные сейчас</b>\n\nВсё выключено."
+        text = "\U0001f7e2 <b>Активные сейчас</b>\n\nНет устройств с подтверждённым активным состоянием."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="\U0001f504 Обновить", callback_data="menu:active")],
             [_home_btn()],
@@ -380,7 +430,7 @@ def build_device_list(
             sc_domain = sc_eid.split(".", 1)[0]
             sc_icon = DOMAIN_ICONS.get(sc_domain, "\U0001f3ac")
             cb = f"qsc:{sc_eid}"
-            if len(cb) <= 64:
+            if cb:
                 rows.append([InlineKeyboardButton(
                     text=f"{sc_icon} {_trunc(sc_name, 25)}",
                     callback_data=cb,
@@ -394,8 +444,6 @@ def build_device_list(
         count = len(dev.get("entity_ids", []))
         suffix = f" ({count})" if count > 1 else ""
         cb = f"dev:{did}"
-        if len(cb) > 64:
-            cb = f"ent:{dev['primary_entity_id']}"
         rows.append([InlineKeyboardButton(
             text=f"{icon} {_trunc(name, 25)}{suffix}",
             callback_data=cb,
@@ -439,11 +487,26 @@ def build_entity_control(
 
     mapped = map_state(entity_id, raw_state, attrs)
     state_label = mapped.ui_label if mapped.ui_label != raw_state else raw_state
-    text = f"{icon} <b>{_sanitize(name)}</b>\n\nСостояние: <code>{_sanitize(state_label)}</code>"
+    text = f"<b>{_sanitize(name)}</b>\n{DOMAIN_LABELS.get(domain, domain)} · {_sanitize(state_label)}"
     state = raw_state  # keep raw for _control_buttons
 
     extra: list[str] = []
-    if domain == "climate":
+    if domain in {"sensor", "binary_sensor", "climate", "humidifier", "water_heater", "vacuum"}:
+        extra.append(observation_age(state_data, max_age=state_data.get("max_report_age_seconds")))
+    if domain == "automation":
+        extra.append("Автоматические запуски: " + ("включены" if state == "on" else "выключены" if state == "off" else "неизвестно"))
+        description = attrs.get("description")
+        extra.append(_sanitize(str(description)[:700]) if description else "Описание не предоставлено Home Assistant.")
+        if attrs.get("last_triggered"):
+            extra.append("Последний запуск: " + _sanitize(str(attrs["last_triggered"])))
+        extra.append("Разовый запуск проверяет условия автоматизации. Результат зависит от её действий.")
+    elif domain == "humidifier":
+        for key, label in (("current_humidity", "Влажность"), ("humidity", "Цель")):
+            if attrs.get(key) is not None:
+                extra.append(f"{label}: {_sanitize(str(attrs[key]))}%")
+        if attrs.get("mode"):
+            extra.append("Режим: " + _sanitize(str(attrs["mode"])))
+    elif domain == "climate":
         ct = attrs.get("current_temperature")
         tt = attrs.get("temperature")
         if ct is not None:
@@ -524,7 +587,10 @@ def build_entity_control(
     if extra:
         text += "\n" + "\n".join(extra)
 
-    rows = _control_buttons(domain, entity_id, state, attrs)
+    unavailable = state == "unavailable" or (state == "unknown" and domain not in {"scene", "button"})
+    rows = _control_buttons(domain, entity_id, state, attrs) if not unavailable else []
+    if unavailable:
+        text += "\n⚠ Нет актуального состояния. Управление временно недоступно."
 
     # Star / Bell row
     util_row: list[InlineKeyboardButton] = []
@@ -534,9 +600,8 @@ def build_entity_control(
     util_row.append(InlineKeyboardButton(text=notif_label, callback_data=f"ntog:{entity_id}"))
     rows.append(util_row)
 
-    rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)])
-    if back_cb != "nav:main":
-        rows.append([_home_btn()])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data=back_cb),
+                 InlineKeyboardButton(text="Обновить", callback_data=f"ent:{entity_id}"), _home_btn()])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -546,11 +611,9 @@ def _control_buttons(
     rows: list[list[InlineKeyboardButton]] = []
 
     if domain in ("light", "switch", "input_boolean", "fan"):
-        rows.append([
-            InlineKeyboardButton(text="\U0001f7e2 ON", callback_data=f"act:{entity_id}:turn_on"),
-            InlineKeyboardButton(text="\u26aa OFF", callback_data=f"act:{entity_id}:turn_off"),
-            InlineKeyboardButton(text="\U0001f504 Toggle", callback_data=f"act:{entity_id}:toggle"),
-        ])
+        service = "turn_off" if state == "on" else "turn_on"
+        rows.append([InlineKeyboardButton(text="Выключить" if state == "on" else "Включить",
+                                          callback_data=f"act:{entity_id}:{service}")])
         if domain == "light":
             supported = attrs.get("supported_color_modes", [])
             has_br = any(m != "onoff" for m in supported) if supported else False
@@ -569,6 +632,18 @@ def _control_buttons(
                     callback_data=f"lclr:{entity_id}",
                 )])
 
+    elif domain == "automation":
+        rows.append([InlineKeyboardButton(text="Отключить автоматизацию" if state == "on" else "Включить автоматизацию",
+                    callback_data=f"atog:{entity_id}:{'turn_off' if state == 'on' else 'turn_on'}")])
+        rows.append([InlineKeyboardButton(text="Запустить один раз…", callback_data=f"atrig:{entity_id}")])
+    elif domain == "humidifier":
+        rows.append([InlineKeyboardButton(text="Выключить" if state == "on" else "Включить",
+                    callback_data=f"act:{entity_id}:{'turn_off' if state == 'on' else 'turn_on'}")])
+        rows.append([InlineKeyboardButton(text="Влажность −", callback_data=f"humi:{entity_id}:down"),
+                     InlineKeyboardButton(text="Влажность +", callback_data=f"humi:{entity_id}:up")])
+        if int(attrs.get("supported_features", 0)) & 1:
+            for mode in attrs.get("available_modes", []):
+                rows.append([InlineKeyboardButton(text=_trunc(str(mode)), callback_data=f"hmode:{entity_id}:{mode}")])
     elif domain == "cover":
         rows.append([
             InlineKeyboardButton(text="\u2b06 Открыть", callback_data=f"act:{entity_id}:open_cover"),
@@ -617,7 +692,7 @@ def _control_buttons(
         rows.append([
             InlineKeyboardButton(text="\u25b6 Play", callback_data=f"act:{entity_id}:media_play"),
             InlineKeyboardButton(text="\u23f8 Pause", callback_data=f"act:{entity_id}:media_pause"),
-            InlineKeyboardButton(text="\u23f9 Stop", callback_data=f"act:{entity_id}:media_stop"),
+            InlineKeyboardButton(text="Стоп", callback_data=f"act:{entity_id}:media_stop"),
         ])
         rows.append([
             InlineKeyboardButton(text="\U0001f509 Vol\u2212", callback_data=f"mvol:{entity_id}:dn"),
@@ -637,7 +712,7 @@ def _control_buttons(
         options = attrs.get("options", [])
         for opt in options[:6]:
             cb = f"ssel:{entity_id}:{opt}"
-            if len(cb) <= 64:
+            if cb:
                 marker = "\u2705 " if state == opt else ""
                 rows.append([InlineKeyboardButton(
                     text=f"{marker}{_trunc(str(opt), 28)}",
@@ -669,11 +744,32 @@ def _control_buttons(
     elif domain == "event":
         pass  # event entities are read-only triggers
 
-    else:
-        rows.append([
-            InlineKeyboardButton(text="\U0001f7e2 ON", callback_data=f"act:{entity_id}:turn_on"),
-            InlineKeyboardButton(text="\u26aa OFF", callback_data=f"act:{entity_id}:turn_off"),
-        ])
+    if "supported_features" in attrs:
+        flags = int(attrs.get("supported_features") or 0)
+        features = {
+            "cover": {"open_cover": 1, "close_cover": 2, "stop_cover": 8},
+            "vacuum": {"start": 8192, "pause": 4, "stop": 8, "return_to_base": 16, "locate": 512},
+            "media_player": {"media_pause": 1, "media_play": 16384, "media_stop": 4096,
+                             "turn_on": 128, "turn_off": 256},
+        }.get(domain, {})
+        filtered = []
+        for row in rows:
+            keep = []
+            for button in row:
+                cb = button.callback_data or ""
+                service = cb.rsplit(":", 1)[-1]
+                needed = features.get(service, 0)
+                if domain == "media_player":
+                    if cb.startswith("mvol:"): needed = 4
+                    if cb.startswith("mmut:"): needed = 8
+                    if cb.startswith("msrc:"): needed = 2048
+                if domain in ("climate", "water_heater") and cb.startswith("clim:"):
+                    needed = 1
+                if not needed or flags & needed:
+                    keep.append(button)
+            if keep:
+                filtered.append(keep)
+        rows = filtered
 
     return rows
 
@@ -694,7 +790,7 @@ def build_light_color_menu(
 
     for i, (label, rgb) in enumerate(COLOR_PRESETS):
         cb = f"lcs:{entity_id}:{i}"
-        if len(cb) <= 64:
+        if cb:
             rows.append([InlineKeyboardButton(text=label, callback_data=cb)])
 
     rows.append([InlineKeyboardButton(text="\u2b05 Назад", callback_data=back_cb)])
@@ -726,7 +822,7 @@ def build_global_color_result(
     color_label: str, count: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Result after applying global color."""
-    text = f"\u2705 {color_label} применён к {count} светильникам"
+    text = f"{color_label}: Home Assistant принял {count} команд.\nФактическое состояние — в карточках света."
     rows: list[list[InlineKeyboardButton]] = []
     rows.append([InlineKeyboardButton(text="\U0001f3a8 Другой цвет", callback_data="menu:gcolor")])
     rows.append([_home_btn()])
@@ -770,6 +866,7 @@ def build_radio_menu(
     current_player: str | None = None,
     players: list[dict[str, Any]] | None = None,
     is_playing: bool = False,
+    playback_state: str = "unknown",
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Radio control menu."""
     if not stations:
@@ -793,19 +890,19 @@ def build_radio_menu(
 
     text = (
         f"\U0001f4fb <b>Радио \U0001f1f7\U0001f1fa</b>\n\n"
-        f"Станция: <b>{_sanitize(station_name)}</b> "
+        f"Выбрана станция: <b>{_sanitize(station_name)}</b> "
         f"({current_idx + 1}/{len(stations)})"
     )
     if current_player:
-        text += f"\nВывод: <code>{_sanitize(current_player)}</code>"
+        text += f"\nВывод: <code>{_sanitize(current_player)}</code>\nСостояние HA: {_sanitize(playback_state)}"
 
     rows: list[list[InlineKeyboardButton]] = []
 
     # Transport controls
     rows.append([
         InlineKeyboardButton(text="\u23ee Пред.", callback_data="rad:prev"),
-        InlineKeyboardButton(text=f"{play_icon} Play", callback_data="rad:play"),
-        InlineKeyboardButton(text="\u23f9 Stop", callback_data="rad:stop"),
+        InlineKeyboardButton(text="▶ Воспроизвести", callback_data="rad:play"),
+        InlineKeyboardButton(text="Стоп", callback_data="rad:stop"),
         InlineKeyboardButton(text="\u23ed След.", callback_data="rad:next"),
     ])
 
@@ -816,7 +913,7 @@ def build_radio_menu(
             pl_name = pl.get("friendly_name", pl_eid)
             marker = "\U0001f50a " if pl_eid == current_player else ""
             cb = f"rout:{pl_eid}"
-            if len(cb) <= 64:
+            if cb:
                 rows.append([InlineKeyboardButton(
                     text=f"{marker}{_trunc(pl_name, 26)}",
                     callback_data=cb,
@@ -920,7 +1017,7 @@ def build_media_source_menu(
     for src in sources[:12]:
         marker = "\u2705 " if src == current_source else ""
         cb = f"msrs:{entity_id}:{src}"
-        if len(cb) <= 64:
+        if cb:
             rows.append([InlineKeyboardButton(
                 text=f"{marker}{_trunc(str(src), 28)}",
                 callback_data=cb,
@@ -1455,16 +1552,7 @@ def build_automations_menu(
         state = a.get("state", "off")
         icon = "\u2705" if state == "on" else "\u274c"
         text += f"{icon} {_sanitize(_trunc(name, 40))}\n"
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{icon} {_trunc(name, 18)}",
-                callback_data=f"atog:{eid}",
-            ),
-            InlineKeyboardButton(
-                text="\u25b6 Run",
-                callback_data=f"atrig:{eid}",
-            ),
-        ])
+        rows.append([InlineKeyboardButton(text=f"{icon} {_trunc(name, 28)}", callback_data=f"ent:{eid}")])
 
     # Pagination
     if pages > 1:
@@ -1500,7 +1588,7 @@ def build_todo_lists_menu(
         eid = td["entity_id"]
         name = td.get("friendly_name", eid)
         cb = f"tdl:{eid}"
-        if len(cb) <= 64:
+        if cb:
             rows.append([InlineKeyboardButton(
                 text=f"\U0001f4cb {_trunc(name, 28)}",
                 callback_data=cb,
@@ -1545,10 +1633,10 @@ def build_todo_items_menu(
         btns: list[InlineKeyboardButton] = []
         if status != "completed":
             cb = f"tdc:{list_eid}:{uid}"
-            if len(cb) <= 64:
+            if cb:
                 btns.append(InlineKeyboardButton(text="\u2705", callback_data=cb))
         cb_del = f"tdd:{list_eid}:{uid}"
-        if len(cb_del) <= 64:
+        if cb_del:
             btns.append(InlineKeyboardButton(
                 text=f"\U0001f5d1 {_trunc(summary, 16)}",
                 callback_data=cb_del,
